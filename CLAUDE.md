@@ -23,6 +23,7 @@ src/
 ├── capture/mod.rs      # PacketSource: live capture + pcap file reading
 ├── protocol/
 │   ├── mod.rs          # Packet parsing, Transport enum, StreamKey, TcpFlags
+│   ├── dns.rs          # DNS query/response parser (via simple-dns)
 │   └── http.rs         # HTTP/1.1 request/response parser
 ├── reassembly/mod.rs   # StreamTable: TCP stream reassembly (emits on PSH/FIN/RST)
 ├── output/mod.rs       # Formatter: text (color-highlighted), JSON, hex dump, HTTP mode
@@ -43,6 +44,7 @@ src/
 - Interface listing (`-L`)
 - Packet count limit (`-n`)
 - `--http` flag: HTTP/1.1-aware mode (parse headers, match against fields)
+- `--dns` flag: DNS-aware mode (parse queries/responses, match against domain names and record data)
 - `--keylog` / `SSLKEYLOGFILE`: TLS 1.3 decryption (AES-128-GCM, AES-256-GCM) — tested
 - TLS 1.2 AES-GCM decryption (ECDHE-ECDSA, ECDHE-RSA, RSA key exchange) — tested
 - `-O` / `--output-file`: write matched packets to pcap file
@@ -52,7 +54,7 @@ src/
 ### Phase 2 — AI + polish
 - Ollama integration for natural language to BPF filter conversion
 - Traffic summarization (`--summarize`)
-- HTTP/2 + DNS + gRPC protocol support
+- HTTP/2 + gRPC protocol support
 - Ratatui TUI mode (`--tui`)
 - Anomaly flagging
 - Container name resolution (Docker/Podman)

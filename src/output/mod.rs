@@ -2,8 +2,9 @@ use colored::Colorize;
 use regex::Regex;
 use serde_json::json;
 
+use crate::protocol::dns::{self, DnsInfo};
 use crate::protocol::http::HttpMessage;
-use crate::protocol::ParsedPacket;
+use crate::protocol::{ParsedPacket, Transport};
 use crate::reassembly::StreamData;
 
 pub struct Formatter {
@@ -11,19 +12,32 @@ pub struct Formatter {
     hex: bool,
     quiet: bool,
     http: bool,
+    dns: bool,
 }
 
 impl Formatter {
-    pub fn new(json: bool, hex: bool, quiet: bool, http: bool) -> Self {
+    pub fn new(json: bool, hex: bool, quiet: bool, http: bool, dns: bool) -> Self {
         Formatter {
             json,
             hex,
             quiet,
             http,
+            dns,
         }
     }
 
     pub fn print_packet(&self, packet: &ParsedPacket, pattern: &Option<Regex>) {
+        if self.dns && packet.transport == Transport::Udp && is_dns_port(packet) {
+            if let Some(info) = dns::parse_dns(&packet.payload) {
+                if self.json {
+                    self.print_dns_json(packet, &info);
+                } else {
+                    self.print_dns_text(packet, &info, pattern);
+                }
+                return;
+            }
+        }
+
         if self.json {
             self.print_packet_json(packet);
         } else {
@@ -160,6 +174,81 @@ impl Formatter {
         });
         println!("{}", j);
     }
+
+    fn print_dns_text(&self, packet: &ParsedPacket, info: &DnsInfo, pattern: &Option<Regex>) {
+        let src = format!(
+            "{}:{}",
+            packet.src_ip.map(|i| i.to_string()).unwrap_or_default(),
+            packet.src_port.unwrap_or(0)
+        );
+        let dst = format!(
+            "{}:{}",
+            packet.dst_ip.map(|i| i.to_string()).unwrap_or_default(),
+            packet.dst_port.unwrap_or(0)
+        );
+
+        if info.is_response {
+            // Response line
+            let qname = info.questions.first().map(|q| q.name.as_str()).unwrap_or("?");
+            let qtype = info.questions.first().map(|q| q.qtype.as_str()).unwrap_or("?");
+            let rcode = dns::rcode_str(info.rcode);
+
+            if !self.quiet {
+                eprintln!(
+                    "{}  {} {} {}  {}  {}  {}",
+                    "DNS R".magenta().bold(),
+                    src.green(),
+                    "→".dimmed(),
+                    dst.yellow(),
+                    qname.white().bold(),
+                    qtype.cyan(),
+                    rcode.yellow()
+                );
+            }
+
+            // Print answer records
+            for r in &info.answers {
+                let line = format!("  {:<6}{:<40} TTL={}", r.rtype, r.rdata, r.ttl);
+                print_highlighted(&line, pattern);
+            }
+            for r in &info.authorities {
+                let line = format!("  {:<6}{:<40} TTL={} (auth)", r.rtype, r.rdata, r.ttl);
+                print_highlighted(&line, pattern);
+            }
+        } else {
+            // Query line
+            let qname = info.questions.first().map(|q| q.name.as_str()).unwrap_or("?");
+            let qtype = info.questions.first().map(|q| q.qtype.as_str()).unwrap_or("?");
+
+            if !self.quiet {
+                eprintln!(
+                    "{}  {} {} {}  {}  {}",
+                    "DNS Q".magenta().bold(),
+                    src.green(),
+                    "→".dimmed(),
+                    dst.yellow(),
+                    qname.white().bold(),
+                    qtype.cyan()
+                );
+            }
+        }
+    }
+
+    fn print_dns_json(&self, packet: &ParsedPacket, info: &DnsInfo) {
+        let j = json!({
+            "type": "dns",
+            "src_ip": packet.src_ip.map(|i| i.to_string()),
+            "dst_ip": packet.dst_ip.map(|i| i.to_string()),
+            "src_port": packet.src_port,
+            "dst_port": packet.dst_port,
+            "dns": info,
+        });
+        println!("{}", j);
+    }
+}
+
+fn is_dns_port(packet: &ParsedPacket) -> bool {
+    packet.src_port == Some(53) || packet.dst_port == Some(53)
 }
 
 /// Print payload with regex matches highlighted in red.

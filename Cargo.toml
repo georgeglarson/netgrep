@@ -36,5 +36,8 @@ colored = "3"
 # TLS parsing
 tls-parser = "0.12"
 
+# DNS parsing
+simple-dns = "0.11"
+
 # Crypto (HKDF, AES-GCM, HMAC for TLS key derivation + decryption)
 ring = "0.17"

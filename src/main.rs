@@ -65,6 +65,10 @@ struct Cli {
     #[arg(long)]
     http: bool,
 
+    /// DNS-aware mode: parse and display DNS queries/responses
+    #[arg(long)]
+    dns: bool,
+
     /// SSLKEYLOGFILE path for TLS decryption
     #[arg(long, env = "SSLKEYLOGFILE")]
     keylog: Option<PathBuf>,
@@ -106,7 +110,7 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let formatter = Formatter::new(cli.json, cli.hex, cli.quiet, cli.http);
+    let formatter = Formatter::new(cli.json, cli.hex, cli.quiet, cli.http, cli.dns);
     let mut stream_table = StreamTable::new();
     let mut match_count: usize = 0;
 
@@ -183,8 +187,18 @@ fn main() -> Result<()> {
                 }
             }
         } else {
+            let match_text = if cli.dns
+                && parsed.transport == protocol::Transport::Udp
+                && (parsed.src_port == Some(53) || parsed.dst_port == Some(53))
+            {
+                protocol::dns::parse_dns(&parsed.payload)
+                    .map(|info| info.display_string())
+                    .unwrap_or_else(|| parsed.payload_str())
+            } else {
+                parsed.payload_str()
+            };
             let matched = match &pattern {
-                Some(re) => re.is_match(&parsed.payload_str()) != cli.invert,
+                Some(re) => re.is_match(&match_text) != cli.invert,
                 None => !cli.invert,
             };
             if matched {

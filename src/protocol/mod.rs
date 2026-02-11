@@ -1,3 +1,4 @@
+pub mod dns;
 pub mod http;
 
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
