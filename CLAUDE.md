@@ -84,6 +84,7 @@ Requires `libpcap-dev` and root/sudo for live capture.
 
 ## Conventions
 
+- **Single Responsibility Principle:** each module owns one concern. When a file accumulates multiple responsibilities, extract the distinct concern into its own module.
 - Keep modules focused: one concern per module
 - Use `anyhow::Result` in application code, `thiserror` for library-style errors
 - Prefer `etherparse` Slice types (zero-copy) over owned Header types
