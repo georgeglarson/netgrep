@@ -1,3 +1,5 @@
+pub(crate) mod pcap_writer;
+
 use anyhow::{Context, Result};
 use pcap::{Capture, Device};
 use std::path::Path;
