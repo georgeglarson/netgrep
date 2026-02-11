@@ -33,6 +33,10 @@ thiserror = "2"
 # Terminal colors
 colored = "3"
 
+# TUI
+ratatui = "0.30"
+crossterm = "0.29"
+
 # TLS parsing
 tls-parser = "0.12"
 

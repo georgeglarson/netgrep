@@ -13,6 +13,7 @@ A modern replacement for ngrep (not a fork). ngrep is alive but architecturally 
 - **Dissection:** `etherparse` (zero-copy packet parsing)
 - **CLI:** `clap` (derive mode)
 - **Output:** `colored` for terminal, `serde_json` for JSON
+- **TUI:** `ratatui` + `crossterm`
 - **Error handling:** `anyhow` + `thiserror`
 
 ## Module Layout
@@ -27,10 +28,13 @@ src/
 │   └── http.rs         # HTTP/1.1 request/response parser
 ├── reassembly/mod.rs   # StreamTable: TCP stream reassembly (emits on PSH/FIN/RST)
 ├── output/mod.rs       # Formatter: text (color-highlighted), JSON, hex dump, HTTP mode
-└── tls/
-    ├── mod.rs          # TlsDecryptor: per-connection state, incremental record parsing
-    ├── keylog.rs       # SSLKEYLOGFILE parser (TLS 1.2 + 1.3 secrets)
-    └── decrypt.rs      # AES-GCM decryption, HKDF-Expand-Label, TLS 1.2 PRF
+├── tls/
+│   ├── mod.rs          # TlsDecryptor: per-connection state, incremental record parsing
+│   ├── keylog.rs       # SSLKEYLOGFILE parser (TLS 1.2 + 1.3 secrets)
+│   └── decrypt.rs      # AES-GCM decryption, HKDF-Expand-Label, TLS 1.2 PRF
+└── tui/
+    ├── mod.rs          # TUI mode: AppState, event loop, rendering (ratatui + crossterm)
+    └── event.rs        # CaptureEvent, RowSummary, DetailContent (data contract)
 ```
 
 ## What's Implemented (Phase 1 — complete)
@@ -48,6 +52,7 @@ src/
 - `--keylog` / `SSLKEYLOGFILE`: TLS 1.3 decryption (AES-128-GCM, AES-256-GCM) — tested
 - TLS 1.2 AES-GCM decryption (ECDHE-ECDSA, ECDHE-RSA, RSA key exchange) — tested
 - `-O` / `--output-file`: write matched packets to pcap file
+- `--tui`: interactive terminal UI mode (ratatui) — packet table + detail pane + status bar
 
 ## What's Stubbed / Not Yet Implemented
 
@@ -55,7 +60,6 @@ src/
 - Ollama integration for natural language to BPF filter conversion
 - Traffic summarization (`--summarize`)
 - HTTP/2 + gRPC protocol support
-- Ratatui TUI mode (`--tui`)
 - Anomaly flagging
 - Container name resolution (Docker/Podman)
 

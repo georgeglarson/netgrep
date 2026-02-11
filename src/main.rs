@@ -3,12 +3,15 @@ mod output;
 mod protocol;
 mod reassembly;
 mod tls;
+mod tui;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use pcap::Device;
 use regex::Regex;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use capture::pcap_writer::PcapWriter;
 use capture::PacketSource;
@@ -88,6 +91,10 @@ struct Cli {
     /// Write matched packets to pcap file
     #[arg(short = 'O', long)]
     output_file: Option<PathBuf>,
+
+    /// Interactive TUI mode
+    #[arg(long)]
+    tui: bool,
 }
 
 fn main() -> Result<()> {
@@ -110,10 +117,6 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let formatter = Formatter::new(cli.json, cli.hex, cli.quiet, cli.http, cli.dns);
-    let mut stream_table = StreamTable::new();
-    let mut match_count: usize = 0;
-
     let mut source = if let Some(ref path) = cli.input {
         PacketSource::from_file(path, cli.bpf.as_deref())?
     } else {
@@ -121,7 +124,6 @@ fn main() -> Result<()> {
         PacketSource::live(interface, cli.snaplen, !cli.no_promisc, cli.bpf.as_deref())?
     };
 
-    // Set up TLS decryptor if keylog file is provided
     let mut tls_decryptor = match &cli.keylog {
         Some(path) => {
             let keylog = tls::keylog::KeyLog::from_file(path)?;
@@ -130,7 +132,23 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    // Set up pcap output file if requested
+    if cli.tui {
+        run_tui_mode(&cli, source, tls_decryptor, pattern)
+    } else {
+        run_cli_mode(&cli, &mut source, &mut tls_decryptor, &pattern)
+    }
+}
+
+fn run_cli_mode(
+    cli: &Cli,
+    source: &mut PacketSource,
+    tls_decryptor: &mut Option<tls::TlsDecryptor>,
+    pattern: &Option<Regex>,
+) -> Result<()> {
+    let formatter = Formatter::new(cli.json, cli.hex, cli.quiet, cli.http, cli.dns);
+    let mut stream_table = StreamTable::new();
+    let mut match_count: usize = 0;
+
     let mut pcap_writer = match &cli.output_file {
         Some(path) => {
             let file = std::fs::File::create(path)
@@ -148,7 +166,7 @@ fn main() -> Result<()> {
 
         // Feed every TCP packet to TLS decryptor incrementally (before reassembly)
         if parsed.is_tcp() {
-            if let Some(ref mut decryptor) = tls_decryptor {
+            if let Some(decryptor) = tls_decryptor.as_mut() {
                 if let (Some(key), Some(src_ip), Some(src_port)) =
                     (parsed.stream_key(), parsed.src_ip, parsed.src_port)
                 {
@@ -160,7 +178,7 @@ fn main() -> Result<()> {
         if cli.reassemble && parsed.is_tcp() {
             if let Some(stream_data) = stream_table.process(&parsed) {
                 // Use decrypted plaintext if available, otherwise raw stream data
-                let effective_payload = if let Some(ref decryptor) = tls_decryptor {
+                let effective_payload = if let Some(decryptor) = tls_decryptor.as_ref() {
                     parsed
                         .stream_key()
                         .and_then(|key| decryptor.get_decrypted(&key))
@@ -179,7 +197,7 @@ fn main() -> Result<()> {
                         key: stream_data.key,
                         payload: effective_payload,
                     };
-                    formatter.print_stream(&display_data, &pattern);
+                    formatter.print_stream(&display_data, pattern);
                     if let Some(ref mut writer) = pcap_writer {
                         let _ = writer.write_packet(packet_data.data, packet_data.timestamp);
                     }
@@ -202,7 +220,7 @@ fn main() -> Result<()> {
                 None => !cli.invert,
             };
             if matched {
-                formatter.print_packet(&parsed, &pattern);
+                formatter.print_packet(&parsed, pattern);
                 if let Some(ref mut writer) = pcap_writer {
                     let _ = writer.write_packet(packet_data.data, packet_data.timestamp);
                 }
@@ -217,6 +235,125 @@ fn main() -> Result<()> {
     })?;
 
     Ok(())
+}
+
+fn run_tui_mode(
+    cli: &Cli,
+    mut source: PacketSource,
+    mut tls_decryptor: Option<tls::TlsDecryptor>,
+    pattern: Option<Regex>,
+) -> Result<()> {
+    let (tx, rx) = crossbeam_channel::unbounded::<tui::event::CaptureEvent>();
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let packets_seen = Arc::new(AtomicU64::new(0));
+
+    let capture_stop = stop_flag.clone();
+    let capture_seen = packets_seen.clone();
+    let reassemble = cli.reassemble;
+    let invert = cli.invert;
+    let dns_mode = cli.dns;
+    let http_mode = cli.http;
+    let count_limit = cli.count;
+
+    let capture_thread = std::thread::spawn(move || {
+        let mut stream_table = StreamTable::new();
+        let mut event_id: usize = 0;
+        let mut match_count: usize = 0;
+
+        let _ = source.for_each_packet(|packet_data| {
+            if capture_stop.load(Ordering::Relaxed) {
+                return false;
+            }
+
+            capture_seen.fetch_add(1, Ordering::Relaxed);
+
+            let parsed = match protocol::parse_packet(packet_data.data) {
+                Some(p) => p,
+                None => return true,
+            };
+
+            // Feed TCP packets to TLS decryptor
+            if parsed.is_tcp() {
+                if let Some(ref mut decryptor) = tls_decryptor {
+                    if let (Some(key), Some(src_ip), Some(src_port)) =
+                        (parsed.stream_key(), parsed.src_ip, parsed.src_port)
+                    {
+                        decryptor.process_packet(&key, &parsed.payload, src_ip, src_port);
+                    }
+                }
+            }
+
+            if reassemble && parsed.is_tcp() {
+                if let Some(stream_data) = stream_table.process(&parsed) {
+                    let effective_payload = if let Some(ref decryptor) = tls_decryptor {
+                        parsed
+                            .stream_key()
+                            .and_then(|key| decryptor.get_decrypted(&key))
+                            .unwrap_or_else(|| stream_data.payload.clone())
+                    } else {
+                        stream_data.payload.clone()
+                    };
+
+                    let effective_str = String::from_utf8_lossy(&effective_payload);
+                    let matched = match &pattern {
+                        Some(re) => re.is_match(&effective_str) != invert,
+                        None => !invert,
+                    };
+                    if matched {
+                        event_id += 1;
+                        let display_data = reassembly::StreamData {
+                            key: stream_data.key,
+                            payload: effective_payload,
+                        };
+                        let event =
+                            tui::event::CaptureEvent::from_stream(event_id, &display_data, http_mode);
+                        if tx.send(event).is_err() {
+                            return false;
+                        }
+                        match_count += 1;
+                    }
+                }
+            } else {
+                let match_text = if dns_mode
+                    && parsed.transport == protocol::Transport::Udp
+                    && (parsed.src_port == Some(53) || parsed.dst_port == Some(53))
+                {
+                    protocol::dns::parse_dns(&parsed.payload)
+                        .map(|info| info.display_string())
+                        .unwrap_or_else(|| parsed.payload_str())
+                } else {
+                    parsed.payload_str()
+                };
+                let matched = match &pattern {
+                    Some(re) => re.is_match(&match_text) != invert,
+                    None => !invert,
+                };
+                if matched {
+                    event_id += 1;
+                    let event =
+                        tui::event::CaptureEvent::from_packet(event_id, &parsed, dns_mode);
+                    if tx.send(event).is_err() {
+                        return false;
+                    }
+                    match_count += 1;
+                }
+            }
+
+            match count_limit {
+                Some(n) => match_count < n,
+                None => true,
+            }
+        });
+    });
+
+    // Run TUI on main thread
+    let result = tui::run_tui(rx, packets_seen, stop_flag.clone());
+
+    // Ensure capture thread stops
+    stop_flag.store(true, Ordering::Relaxed);
+    let _ = capture_thread.join();
+
+    result
 }
 
 fn list_interfaces() -> Result<()> {
