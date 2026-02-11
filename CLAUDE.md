@@ -19,16 +19,22 @@ A modern replacement for ngrep (not a fork). ngrep is alive but architecturally 
 
 ```
 src/
-├── main.rs             # CLI definition (clap), main capture loop
+├── main.rs             # CLI definition (clap), main capture loop, PcapWriter
 ├── capture/mod.rs      # PacketSource: live capture + pcap file reading
-├── protocol/mod.rs     # Packet parsing, Transport enum, StreamKey, TcpFlags
+├── protocol/
+│   ├── mod.rs          # Packet parsing, Transport enum, StreamKey, TcpFlags
+│   └── http.rs         # HTTP/1.1 request/response parser
 ├── reassembly/mod.rs   # StreamTable: TCP stream reassembly (emits on PSH/FIN/RST)
-└── output/mod.rs       # Formatter: text (color-highlighted), JSON, hex dump
+├── output/mod.rs       # Formatter: text (color-highlighted), JSON, hex dump, HTTP mode
+└── tls/
+    ├── mod.rs          # TlsDecryptor: per-connection state, incremental record parsing
+    ├── keylog.rs       # SSLKEYLOGFILE parser (TLS 1.2 + 1.3 secrets)
+    └── decrypt.rs      # AES-GCM decryption, HKDF-Expand-Label, TLS 1.2 PRF
 ```
 
-## What's Implemented (Phase 1 — partial)
+## What's Implemented (Phase 1 — complete)
 
-- Live capture and pcap file reading
+- Live capture and pcap/pcapng file reading (pcapng via libpcap native support)
 - BPF filter support (`-F`)
 - Regex matching against payloads with color highlighting
 - TCP stream reassembly (bidirectional, emits on PSH/FIN/RST)
@@ -36,14 +42,12 @@ src/
 - Case-insensitive (`-i`) and inverted (`-v`) matching
 - Interface listing (`-L`)
 - Packet count limit (`-n`)
+- `--http` flag: HTTP/1.1-aware mode (parse headers, match against fields)
+- `--keylog` / `SSLKEYLOGFILE`: TLS 1.3 decryption (AES-128-GCM, AES-256-GCM) — tested
+- TLS 1.2 AES-GCM decryption (ECDHE-ECDSA, ECDHE-RSA, RSA key exchange) — tested
+- `-O` / `--output-file`: write matched packets to pcap file
 
 ## What's Stubbed / Not Yet Implemented
-
-### Phase 1 (remaining)
-- `--http` flag: HTTP/1.1-aware mode (parse headers, match against fields)
-- `--keylog` / SSLKEYLOGFILE: TLS decryption using browser key logs
-- `-O` / `--output-file`: write matched packets to pcap file
-- pcapng reading (pcap crate may handle this already)
 
 ### Phase 2 — AI + polish
 - Ollama integration for natural language to BPF filter conversion

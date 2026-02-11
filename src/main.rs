@@ -2,6 +2,7 @@ mod capture;
 mod output;
 mod protocol;
 mod reassembly;
+mod tls;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -115,6 +116,15 @@ fn main() -> Result<()> {
         PacketSource::live(interface, cli.snaplen, !cli.no_promisc, cli.bpf.as_deref())?
     };
 
+    // Set up TLS decryptor if keylog file is provided
+    let mut tls_decryptor = match &cli.keylog {
+        Some(path) => {
+            let keylog = tls::keylog::KeyLog::from_file(path)?;
+            Some(tls::TlsDecryptor::new(keylog))
+        }
+        None => None,
+    };
+
     // Set up pcap output file if requested
     let mut pcap_writer = match &cli.output_file {
         Some(path) => {
@@ -131,14 +141,40 @@ fn main() -> Result<()> {
             None => return true,
         };
 
+        // Feed every TCP packet to TLS decryptor incrementally (before reassembly)
+        if parsed.is_tcp() {
+            if let Some(ref mut decryptor) = tls_decryptor {
+                if let (Some(key), Some(src_ip), Some(src_port)) =
+                    (parsed.stream_key(), parsed.src_ip, parsed.src_port)
+                {
+                    decryptor.process_packet(&key, &parsed.payload, src_ip, src_port);
+                }
+            }
+        }
+
         if cli.reassemble && parsed.is_tcp() {
             if let Some(stream_data) = stream_table.process(&parsed) {
+                // Use decrypted plaintext if available, otherwise raw stream data
+                let effective_payload = if let Some(ref decryptor) = tls_decryptor {
+                    parsed
+                        .stream_key()
+                        .and_then(|key| decryptor.get_decrypted(&key))
+                        .unwrap_or_else(|| stream_data.payload.clone())
+                } else {
+                    stream_data.payload.clone()
+                };
+
+                let effective_str = String::from_utf8_lossy(&effective_payload);
                 let matched = match &pattern {
-                    Some(re) => re.is_match(&stream_data.payload_str()) != cli.invert,
+                    Some(re) => re.is_match(&effective_str) != cli.invert,
                     None => !cli.invert,
                 };
                 if matched {
-                    formatter.print_stream(&stream_data, &pattern);
+                    let display_data = reassembly::StreamData {
+                        key: stream_data.key,
+                        payload: effective_payload,
+                    };
+                    formatter.print_stream(&display_data, &pattern);
                     if let Some(ref mut writer) = pcap_writer {
                         let _ = writer.write_packet(packet_data.data, packet_data.timestamp);
                     }

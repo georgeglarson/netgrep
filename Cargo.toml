@@ -32,3 +32,9 @@ thiserror = "2"
 
 # Terminal colors
 colored = "3"
+
+# TLS parsing
+tls-parser = "0.12"
+
+# Crypto (HKDF, AES-GCM, HMAC for TLS key derivation + decryption)
+ring = "0.17"
