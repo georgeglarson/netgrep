@@ -526,4 +526,217 @@ mod tests {
             assert_eq!(info.questions[0].qtype, expected, "qtype mismatch for {:?}", qtype);
         }
     }
+
+    #[test]
+    fn parse_soa_response() {
+        let wire = build_response(
+            20,
+            "example.com",
+            TYPE::SOA,
+            vec![RData::SOA(rdata::SOA {
+                mname: Name::new("ns1.example.com").unwrap(),
+                rname: Name::new("admin.example.com").unwrap(),
+                serial: 2024010101,
+                refresh: 3600,
+                retry: 900,
+                expire: 604800,
+                minimum: 86400,
+            })],
+        );
+        let info = parse_dns(&wire).unwrap();
+
+        assert_eq!(info.answers[0].rtype, "SOA");
+        assert_eq!(info.answers[0].rdata, "ns1.example.com admin.example.com 2024010101");
+    }
+
+    #[test]
+    fn nxdomain_with_soa_authority() {
+        // Real-world pattern: NXDOMAIN responses include SOA in authority section
+        let mut pkt = Packet::new_reply(21);
+        *pkt.rcode_mut() = RCODE::NameError;
+        pkt.questions.push(Question::new(
+            Name::new("nonexistent.example.com").unwrap(),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        pkt.name_servers.push(ResourceRecord::new(
+            Name::new("example.com").unwrap(),
+            CLASS::IN,
+            900,
+            RData::SOA(rdata::SOA {
+                mname: Name::new("ns1.example.com").unwrap(),
+                rname: Name::new("admin.example.com").unwrap(),
+                serial: 2024010101,
+                refresh: 3600,
+                retry: 900,
+                expire: 604800,
+                minimum: 86400,
+            }),
+        ));
+        let wire = pkt.build_bytes_vec().unwrap();
+        let info = parse_dns(&wire).unwrap();
+
+        assert_eq!(info.rcode, 3);
+        assert!(info.answers.is_empty());
+        assert_eq!(info.authorities.len(), 1);
+        assert_eq!(info.authorities[0].rtype, "SOA");
+        assert!(info.authorities[0].rdata.contains("ns1.example.com"));
+        let display = info.display_string();
+        assert!(display.contains("NXDOMAIN"));
+        assert!(display.contains("ns1.example.com"));
+    }
+
+    #[test]
+    fn cname_chain_with_a_record() {
+        // Common: www.example.com CNAME example.com, then A record for example.com
+        let mut pkt = Packet::new_reply(22);
+        pkt.questions.push(Question::new(
+            Name::new("www.example.com").unwrap(),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        pkt.answers.push(ResourceRecord::new(
+            Name::new("www.example.com").unwrap(),
+            CLASS::IN,
+            300,
+            RData::CNAME(rdata::CNAME(Name::new("example.com").unwrap())),
+        ));
+        pkt.answers.push(ResourceRecord::new(
+            Name::new("example.com").unwrap(),
+            CLASS::IN,
+            3600,
+            RData::A(rdata::A { address: u32::from(Ipv4Addr::new(93, 184, 216, 34)) }),
+        ));
+        let wire = pkt.build_bytes_vec().unwrap();
+        let info = parse_dns(&wire).unwrap();
+
+        assert_eq!(info.answers.len(), 2);
+        assert_eq!(info.answers[0].rtype, "CNAME");
+        assert_eq!(info.answers[0].rdata, "example.com");
+        assert_eq!(info.answers[0].name, "www.example.com");
+        assert_eq!(info.answers[1].rtype, "A");
+        assert_eq!(info.answers[1].rdata, "93.184.216.34");
+        assert_eq!(info.answers[1].name, "example.com");
+    }
+
+    #[test]
+    fn additional_records_in_display_string() {
+        // Glue records: NS response with A records in additional section
+        let mut pkt = Packet::new_reply(23);
+        pkt.questions.push(Question::new(
+            Name::new("example.com").unwrap(),
+            QTYPE::TYPE(TYPE::NS),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        pkt.answers.push(ResourceRecord::new(
+            Name::new("example.com").unwrap(),
+            CLASS::IN,
+            86400,
+            RData::NS(rdata::NS(Name::new("ns1.example.com").unwrap())),
+        ));
+        pkt.additional_records.push(ResourceRecord::new(
+            Name::new("ns1.example.com").unwrap(),
+            CLASS::IN,
+            86400,
+            RData::A(rdata::A { address: u32::from(Ipv4Addr::new(198, 51, 100, 1)) }),
+        ));
+        let wire = pkt.build_bytes_vec().unwrap();
+        let info = parse_dns(&wire).unwrap();
+
+        assert_eq!(info.additionals.len(), 1);
+        assert_eq!(info.additionals[0].rdata, "198.51.100.1");
+        // display_string should include additional records for pattern matching
+        let display = info.display_string();
+        assert!(display.contains("198.51.100.1"));
+        assert!(display.contains("ns1.example.com"));
+    }
+
+    #[test]
+    fn qtype_any() {
+        let mut pkt = Packet::new_query(24);
+        pkt.questions.push(Question::new(
+            Name::new("example.com").unwrap(),
+            QTYPE::ANY,
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        let wire = pkt.build_bytes_vec().unwrap();
+        let info = parse_dns(&wire).unwrap();
+
+        assert_eq!(info.questions[0].qtype, "ANY");
+    }
+
+    #[test]
+    fn txt_bare_value_without_equals() {
+        // TXT record with no "=" sign — tests the bare key branch
+        let txt = rdata::TXT::new().with_string("just-a-token").unwrap();
+        let wire = build_response(25, "example.com", TYPE::TXT, vec![RData::TXT(txt)]);
+        let info = parse_dns(&wire).unwrap();
+
+        assert_eq!(info.answers[0].rtype, "TXT");
+        assert!(info.answers[0].rdata.contains("just-a-token"));
+    }
+
+    #[test]
+    fn refused_response() {
+        let mut pkt = Packet::new_reply(26);
+        *pkt.rcode_mut() = RCODE::Refused;
+        pkt.questions.push(Question::new(
+            Name::new("blocked.example.com").unwrap(),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        let wire = pkt.build_bytes_vec().unwrap();
+        let info = parse_dns(&wire).unwrap();
+
+        assert_eq!(info.rcode, 5);
+        assert!(info.display_string().contains("REFUSED"));
+    }
+
+    #[test]
+    fn packet_id_boundaries() {
+        let wire_zero = build_query(0, "example.com", TYPE::A);
+        assert_eq!(parse_dns(&wire_zero).unwrap().id, 0);
+
+        let wire_max = build_query(u16::MAX, "example.com", TYPE::A);
+        assert_eq!(parse_dns(&wire_max).unwrap().id, u16::MAX);
+    }
+
+    #[test]
+    fn mixed_a_and_aaaa_response() {
+        // Some resolvers return both A and AAAA in one response
+        let mut pkt = Packet::new_reply(28);
+        pkt.questions.push(Question::new(
+            Name::new("dual.example.com").unwrap(),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        pkt.answers.push(ResourceRecord::new(
+            Name::new("dual.example.com").unwrap(),
+            CLASS::IN,
+            300,
+            RData::A(rdata::A { address: u32::from(Ipv4Addr::new(10, 0, 0, 1)) }),
+        ));
+        pkt.answers.push(ResourceRecord::new(
+            Name::new("dual.example.com").unwrap(),
+            CLASS::IN,
+            300,
+            RData::AAAA(rdata::AAAA {
+                address: Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+            }),
+        ));
+        let wire = pkt.build_bytes_vec().unwrap();
+        let info = parse_dns(&wire).unwrap();
+
+        assert_eq!(info.answers.len(), 2);
+        assert_eq!(info.answers[0].rtype, "A");
+        assert_eq!(info.answers[0].rdata, "10.0.0.1");
+        assert_eq!(info.answers[1].rtype, "AAAA");
+        assert_eq!(info.answers[1].rdata, "2001:db8::1");
+    }
 }
