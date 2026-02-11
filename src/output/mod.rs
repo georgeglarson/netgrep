@@ -2,6 +2,7 @@ use colored::Colorize;
 use regex::Regex;
 use serde_json::json;
 
+use crate::protocol::http::HttpMessage;
 use crate::protocol::ParsedPacket;
 use crate::reassembly::StreamData;
 
@@ -9,11 +10,17 @@ pub struct Formatter {
     json: bool,
     hex: bool,
     quiet: bool,
+    http: bool,
 }
 
 impl Formatter {
-    pub fn new(json: bool, hex: bool, quiet: bool) -> Self {
-        Formatter { json, hex, quiet }
+    pub fn new(json: bool, hex: bool, quiet: bool, http: bool) -> Self {
+        Formatter {
+            json,
+            hex,
+            quiet,
+            http,
+        }
     }
 
     pub fn print_packet(&self, packet: &ParsedPacket, pattern: &Option<Regex>) {
@@ -25,6 +32,20 @@ impl Formatter {
     }
 
     pub fn print_stream(&self, stream: &StreamData, pattern: &Option<Regex>) {
+        if self.http {
+            let messages = crate::protocol::http::parse_http(&stream.payload);
+            if !messages.is_empty() {
+                for msg in &messages {
+                    if self.json {
+                        self.print_http_json(&stream.key.to_string(), msg);
+                    } else {
+                        self.print_http_text(&stream.key.to_string(), msg, pattern);
+                    }
+                }
+                return;
+            }
+        }
+
         if self.json {
             self.print_stream_json(stream);
         } else {
@@ -85,6 +106,28 @@ impl Formatter {
         }
     }
 
+    fn print_http_text(&self, stream_id: &str, msg: &HttpMessage, pattern: &Option<Regex>) {
+        if !self.quiet {
+            let label = match &msg.kind {
+                crate::protocol::http::HttpKind::Request { method, uri, .. } => {
+                    format!("{} {}", method, uri)
+                }
+                crate::protocol::http::HttpKind::Response { status, reason, .. } => {
+                    format!("{} {}", status, reason)
+                }
+            };
+            eprintln!(
+                "{} {} {}",
+                "HTTP".magenta().bold(),
+                stream_id.green(),
+                label.yellow()
+            );
+        }
+
+        let display = msg.display_string();
+        print_highlighted(&display, pattern);
+    }
+
     fn print_packet_json(&self, packet: &ParsedPacket) {
         let j = json!({
             "type": "packet",
@@ -105,6 +148,15 @@ impl Formatter {
             "stream": stream.key.to_string(),
             "payload_len": stream.payload.len(),
             "payload": stream.payload_str(),
+        });
+        println!("{}", j);
+    }
+
+    fn print_http_json(&self, stream_id: &str, msg: &HttpMessage) {
+        let j = json!({
+            "type": "http",
+            "stream": stream_id,
+            "message": msg,
         });
         println!("{}", j);
     }

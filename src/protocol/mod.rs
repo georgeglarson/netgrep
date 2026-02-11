@@ -1,3 +1,5 @@
+pub mod http;
+
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use std::net::IpAddr;
 
