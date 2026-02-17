@@ -5,12 +5,14 @@ use crate::protocol::dns::{self, DnsInfo};
 use crate::protocol::http::{self, HttpMessage};
 use crate::reassembly::StreamData;
 
+/// A single capture event displayed in the TUI, containing a summary row and detail pane content.
 pub struct CaptureEvent {
     pub id: usize,
     pub summary: RowSummary,
     pub detail: DetailContent,
 }
 
+/// Summary columns for one row in the TUI packet table.
 pub struct RowSummary {
     pub proto: String,
     pub src: String,
@@ -18,6 +20,7 @@ pub struct RowSummary {
     pub info: String,
 }
 
+/// Content shown in the TUI detail pane when a row is selected.
 pub enum DetailContent {
     Packet { header: String, payload: Vec<u8> },
     Stream { header: String, payload: Vec<u8> },

@@ -51,6 +51,7 @@ pub struct ParsedPacket {
     pub timestamp: Option<std::time::SystemTime>,
 }
 
+/// Transport protocol identified in the packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transport {
     Tcp,
@@ -59,6 +60,7 @@ pub enum Transport {
     Other,
 }
 
+/// TCP header flags extracted from a parsed packet.
 #[derive(Debug, Clone, Copy)]
 pub struct TcpFlags {
     pub syn: bool,

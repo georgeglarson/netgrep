@@ -5,7 +5,10 @@ edition = "2024"
 rust-version = "1.85"
 description = "Grep for the network, for a post-TLS world"
 license = "MIT"
-repository = "https://github.com/gerg/netgrep"
+repository = "https://github.com/georgeglarson/netgrep"
+homepage = "https://github.com/georgeglarson/netgrep"
+keywords = ["network", "pcap", "packet", "grep", "tls"]
+categories = ["command-line-utilities", "network-programming"]
 
 [dependencies]
 # CLI

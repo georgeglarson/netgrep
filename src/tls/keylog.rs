@@ -12,6 +12,7 @@ pub struct KeyLog {
     pub tls13_secrets: HashMap<[u8; 32], Tls13Secrets>,
 }
 
+/// TLS 1.3 per-connection secrets (handshake + application traffic keys).
 #[derive(Default, Clone, Zeroize)]
 #[zeroize(drop)]
 pub struct Tls13Secrets {

@@ -159,9 +159,10 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
         for line in lines {
             if (line.starts_with(' ') || line.starts_with('\t')) && !headers.is_empty() {
                 // Continuation line: append to previous header value
-                let last = headers.last_mut().unwrap();
-                last.1.push(' ');
-                last.1.push_str(line.trim());
+                if let Some(last) = headers.last_mut() {
+                    last.1.push(' ');
+                    last.1.push_str(line.trim());
+                }
             } else if let Some((key, value)) = line.split_once(':') {
                 headers.push((key.trim().to_string(), value.trim().to_string()));
             }

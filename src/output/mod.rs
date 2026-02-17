@@ -7,6 +7,7 @@ use crate::protocol::dns::{self, DnsInfo};
 use crate::protocol::http::HttpMessage;
 use crate::reassembly::StreamData;
 
+/// Output formatter supporting text (with color highlighting), JSON, hex dump, and protocol-aware modes.
 pub struct Formatter {
     json: bool,
     hex: bool,
