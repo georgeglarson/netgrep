@@ -1,6 +1,6 @@
+use crate::protocol::ParsedPacket;
 use crate::protocol::dns::{self, DnsInfo};
 use crate::protocol::http::{self, HttpMessage};
-use crate::protocol::{ParsedPacket, Transport};
 use crate::reassembly::StreamData;
 
 pub struct CaptureEvent {
@@ -57,7 +57,7 @@ impl CaptureEvent {
         let dst = format_addr(parsed.dst_ip, parsed.dst_port);
 
         // Check for DNS
-        if dns_mode && parsed.transport == Transport::Udp && parsed.is_dns_port() {
+        if dns_mode && parsed.is_dns_port() {
             if let Some(info) = dns::parse_dns(&parsed.payload) {
                 return Self::from_dns(id, &src, &dst, &info);
             }
@@ -170,6 +170,12 @@ impl CaptureEvent {
         for r in &info.authorities {
             display.push_str(&format!(
                 "AUTH: {} {} {} TTL={}\n",
+                r.name, r.rtype, r.rdata, r.ttl
+            ));
+        }
+        for r in &info.additionals {
+            display.push_str(&format!(
+                "ADD: {} {} {} TTL={}\n",
                 r.name, r.rtype, r.rdata, r.ttl
             ));
         }

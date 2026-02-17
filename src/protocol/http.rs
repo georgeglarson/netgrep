@@ -58,16 +58,25 @@ impl HttpMessage {
     }
 }
 
+/// Find the byte position of `\r\n\r\n` in a byte slice.
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    data.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+/// Find the byte position of `\r\n` in a byte slice.
+fn find_crlf(data: &[u8]) -> Option<usize> {
+    data.windows(2).position(|w| w == b"\r\n")
+}
+
 /// Try to parse one or more HTTP messages from a stream payload.
 /// Returns all successfully parsed messages.
+/// Operates on raw bytes to avoid UTF-8 offset mismatches with binary bodies.
 pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
-    let text = String::from_utf8_lossy(data);
     let mut messages = Vec::new();
-    let mut remaining = text.as_ref();
+    let mut remaining = data;
 
     while !remaining.is_empty() {
-        // Find the end of headers
-        let header_end = match remaining.find("\r\n\r\n") {
+        let header_end = match find_header_end(remaining) {
             Some(pos) => pos,
             None => break,
         };
@@ -75,16 +84,16 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
         let header_section = &remaining[..header_end];
         let after_headers = &remaining[header_end + 4..];
 
-        let mut lines = header_section.lines();
+        // Headers are text — parse as lossy UTF-8
+        let header_text = String::from_utf8_lossy(header_section);
+        let mut lines = header_text.lines();
 
-        // Parse the start line
         let start_line = match lines.next() {
             Some(l) => l,
             None => break,
         };
 
         let kind = if start_line.starts_with("HTTP/") {
-            // Response
             let parts: Vec<&str> = start_line.splitn(3, ' ').collect();
             if parts.len() < 2 {
                 break;
@@ -95,7 +104,6 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
                 reason: parts.get(2).unwrap_or(&"").to_string(),
             }
         } else {
-            // Request
             let parts: Vec<&str> = start_line.splitn(3, ' ').collect();
             if parts.len() < 2 {
                 break;
@@ -107,7 +115,6 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
             }
         };
 
-        // Parse headers
         let mut headers = Vec::new();
         for line in lines {
             if let Some((key, value)) = line.split_once(':') {
@@ -115,7 +122,6 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
             }
         }
 
-        // Extract body based on Content-Length or Transfer-Encoding
         let content_length: Option<usize> = headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
@@ -127,12 +133,18 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
 
         let (body, consumed) = if is_chunked {
             match decode_chunked(after_headers) {
-                Some((decoded, bytes_consumed)) => (decoded, bytes_consumed),
+                Some((decoded, bytes_consumed)) => (
+                    String::from_utf8_lossy(&decoded).into_owned(),
+                    bytes_consumed,
+                ),
                 None => (String::new(), 0),
             }
         } else {
             let len = content_length.unwrap_or(0).min(after_headers.len());
-            (after_headers[..len].to_string(), len)
+            (
+                String::from_utf8_lossy(&after_headers[..len]).into_owned(),
+                len,
+            )
         };
 
         remaining = &after_headers[consumed..];
@@ -147,41 +159,38 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
     messages
 }
 
-/// Decode a chunked transfer-encoded body.
-/// Returns (decoded_body, total_bytes_consumed) or None if incomplete.
-fn decode_chunked(data: &str) -> Option<(String, usize)> {
-    let mut decoded = String::new();
+/// Decode a chunked transfer-encoded body from raw bytes.
+/// Returns (decoded_body_bytes, total_bytes_consumed) or None if incomplete.
+fn decode_chunked(data: &[u8]) -> Option<(Vec<u8>, usize)> {
+    let mut decoded = Vec::new();
     let mut pos = 0;
 
     loop {
-        // Find the end of the chunk size line
-        let line_end = data[pos..].find("\r\n")?;
-        let size_str = &data[pos..pos + line_end];
+        let line_end = find_crlf(&data[pos..])?;
+        let size_line = &data[pos..pos + line_end];
 
-        // Chunk size may have extensions after a semicolon
+        // Chunk size line is ASCII — parse as string
+        let size_str = std::str::from_utf8(size_line).ok()?;
         let size_part = size_str.split(';').next().unwrap_or(size_str).trim();
         let chunk_size = usize::from_str_radix(size_part, 16).ok()?;
 
-        pos += line_end + 2; // skip past \r\n
+        pos += line_end + 2;
 
         if chunk_size == 0 {
-            // Terminal chunk — skip optional trailers
-            if let Some(trailer_end) = data[pos..].find("\r\n") {
+            if let Some(trailer_end) = find_crlf(&data[pos..]) {
                 pos += trailer_end + 2;
             }
             break;
         }
 
-        // Ensure we have enough data for the chunk
         if pos + chunk_size > data.len() {
             return None;
         }
 
-        decoded.push_str(&data[pos..pos + chunk_size]);
+        decoded.extend_from_slice(&data[pos..pos + chunk_size]);
         pos += chunk_size;
 
-        // Each chunk ends with \r\n
-        if data[pos..].starts_with("\r\n") {
+        if data[pos..].starts_with(b"\r\n") {
             pos += 2;
         } else {
             return None;
@@ -199,57 +208,57 @@ mod tests {
 
     #[test]
     fn chunked_single_chunk() {
-        let data = "5\r\nhello\r\n0\r\n\r\n";
+        let data = b"5\r\nhello\r\n0\r\n\r\n";
         let (body, consumed) = decode_chunked(data).unwrap();
-        assert_eq!(body, "hello");
+        assert_eq!(body, b"hello");
         assert_eq!(consumed, data.len());
     }
 
     #[test]
     fn chunked_multiple_chunks() {
-        let data = "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let data = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
         let (body, _) = decode_chunked(data).unwrap();
-        assert_eq!(body, "hello world");
+        assert_eq!(body, b"hello world");
     }
 
     #[test]
     fn chunked_with_extension() {
-        let data = "5;name=value\r\nhello\r\n0\r\n\r\n";
+        let data = b"5;name=value\r\nhello\r\n0\r\n\r\n";
         let (body, _) = decode_chunked(data).unwrap();
-        assert_eq!(body, "hello");
+        assert_eq!(body, b"hello");
     }
 
     #[test]
     fn chunked_incomplete_body() {
         // Says 10 bytes but only 5 available
-        let data = "a\r\nhello\r\n";
-        assert!(decode_chunked(data).is_none());
+        let data = b"a\r\nhello\r\n";
+        assert!(decode_chunked(data.as_slice()).is_none());
     }
 
     #[test]
     fn chunked_missing_crlf_after_data() {
-        let data = "5\r\nhello0\r\n\r\n"; // missing \r\n after "hello"
-        assert!(decode_chunked(data).is_none());
+        let data = b"5\r\nhello0\r\n\r\n"; // missing \r\n after "hello"
+        assert!(decode_chunked(data.as_slice()).is_none());
     }
 
     #[test]
     fn chunked_invalid_hex() {
-        let data = "xyz\r\nhello\r\n0\r\n\r\n";
-        assert!(decode_chunked(data).is_none());
+        let data = b"xyz\r\nhello\r\n0\r\n\r\n";
+        assert!(decode_chunked(data.as_slice()).is_none());
     }
 
     #[test]
     fn chunked_no_terminating_crlf() {
         // Incomplete — no \r\n after chunk size
-        let data = "5";
-        assert!(decode_chunked(data).is_none());
+        let data = b"5";
+        assert!(decode_chunked(data.as_slice()).is_none());
     }
 
     #[test]
     fn chunked_empty_body() {
-        let data = "0\r\n\r\n";
+        let data = b"0\r\n\r\n";
         let (body, _) = decode_chunked(data).unwrap();
-        assert_eq!(body, "");
+        assert_eq!(body, b"");
     }
 
     // -- parse_http tests --

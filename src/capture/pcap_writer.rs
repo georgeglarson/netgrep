@@ -9,15 +9,15 @@ pub(crate) struct PcapWriter<W: Write> {
 }
 
 impl<W: Write> PcapWriter<W> {
-    pub(crate) fn new(mut writer: W) -> Result<Self> {
-        // Global header: magic, version 2.4, timezone 0, sigfigs 0, snaplen 65535, network 1 (Ethernet)
+    pub(crate) fn new(mut writer: W, link_type: u32) -> Result<Self> {
+        // Global header: magic, version 2.4, timezone 0, sigfigs 0, snaplen 65535
         writer.write_all(&0xa1b2c3d4u32.to_ne_bytes())?; // magic
         writer.write_all(&2u16.to_ne_bytes())?; // version_major
         writer.write_all(&4u16.to_ne_bytes())?; // version_minor
         writer.write_all(&0i32.to_ne_bytes())?; // thiszone
         writer.write_all(&0u32.to_ne_bytes())?; // sigfigs
         writer.write_all(&65535u32.to_ne_bytes())?; // snaplen
-        writer.write_all(&1u32.to_ne_bytes())?; // network (LINKTYPE_ETHERNET)
+        writer.write_all(&link_type.to_ne_bytes())?; // network
         Ok(PcapWriter { writer })
     }
 
@@ -60,7 +60,7 @@ mod tests {
     #[test]
     fn global_header_correct() {
         let buf = Vec::new();
-        let writer = PcapWriter::new(buf).unwrap();
+        let writer = PcapWriter::new(buf, 1).unwrap();
         let data = &writer.writer;
         assert_eq!(data.len(), 24); // Global header is 24 bytes
         assert_eq!(read_u32_ne(data, 0), 0xa1b2c3d4); // magic
@@ -71,9 +71,17 @@ mod tests {
     }
 
     #[test]
+    fn global_header_linux_sll_link_type() {
+        let buf = Vec::new();
+        let writer = PcapWriter::new(buf, 113).unwrap();
+        let data = &writer.writer;
+        assert_eq!(read_u32_ne(data, 20), 113); // network (Linux SLL)
+    }
+
+    #[test]
     fn write_packet_epoch() {
         let buf = Vec::new();
-        let mut writer = PcapWriter::new(buf).unwrap();
+        let mut writer = PcapWriter::new(buf, 1).unwrap();
         writer.write_packet(b"test", std::time::UNIX_EPOCH).unwrap();
         let data = &writer.writer;
         // Global header (24) + packet header (16) + payload (4) = 44
@@ -88,7 +96,7 @@ mod tests {
     #[test]
     fn write_packet_with_timestamp() {
         let buf = Vec::new();
-        let mut writer = PcapWriter::new(buf).unwrap();
+        let mut writer = PcapWriter::new(buf, 1).unwrap();
         let ts = std::time::UNIX_EPOCH + Duration::new(1000, 500_000_000); // 1000s + 500ms
         writer.write_packet(b"hi", ts).unwrap();
         let data = &writer.writer;
@@ -100,7 +108,7 @@ mod tests {
     #[test]
     fn write_multiple_packets() {
         let buf = Vec::new();
-        let mut writer = PcapWriter::new(buf).unwrap();
+        let mut writer = PcapWriter::new(buf, 1).unwrap();
         writer.write_packet(b"aaa", std::time::UNIX_EPOCH).unwrap();
         writer
             .write_packet(b"bbbbb", std::time::UNIX_EPOCH)
@@ -115,7 +123,7 @@ mod tests {
     #[test]
     fn drop_flushes() {
         let buf = Cursor::new(Vec::new());
-        let writer = PcapWriter::new(buf).unwrap();
+        let writer = PcapWriter::new(buf, 1).unwrap();
         // Drop should not panic
         drop(writer);
     }
@@ -123,7 +131,7 @@ mod tests {
     #[test]
     fn write_empty_packet() {
         let buf = Vec::new();
-        let mut writer = PcapWriter::new(buf).unwrap();
+        let mut writer = PcapWriter::new(buf, 1).unwrap();
         writer.write_packet(&[], std::time::UNIX_EPOCH).unwrap();
         let data = &writer.writer;
         assert_eq!(data.len(), 24 + 16); // no payload bytes

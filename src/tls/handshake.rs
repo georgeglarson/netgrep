@@ -27,6 +27,10 @@ pub(crate) fn parse_handshake(
 ) -> Option<HandshakeResult> {
     // Reconstruct a full TLS record so parse_tls_plaintext can parse it.
     // parse_tls_plaintext expects: type(1) + version(2) + length(2) + body
+    // TLS record length field is u16, so bail if data exceeds 65535 bytes
+    if data.len() > 65535 {
+        return None;
+    }
     let mut full = Vec::with_capacity(5 + data.len());
     full.push(0x16); // ContentType::Handshake
     full.extend_from_slice(&[0x03, 0x03]); // TLS 1.2 record version

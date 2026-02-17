@@ -12,6 +12,17 @@ pub enum LinkType {
     RawIp,
 }
 
+impl LinkType {
+    /// Return the pcap link-layer header type value (DLT_*).
+    pub fn pcap_link_type(self) -> u32 {
+        match self {
+            LinkType::Ethernet => 1,   // DLT_EN10MB
+            LinkType::RawIp => 101,    // DLT_RAW
+            LinkType::LinuxSll => 113, // DLT_LINUX_SLL
+        }
+    }
+}
+
 /// A parsed packet with extracted header info and payload.
 #[derive(Debug)]
 pub struct ParsedPacket {

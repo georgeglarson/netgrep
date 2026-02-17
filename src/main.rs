@@ -89,7 +89,7 @@ struct Cli {
     list_interfaces: bool,
 
     /// Snap length (bytes to capture per packet)
-    #[arg(short = 's', long, default_value_t = 65535)]
+    #[arg(short = 's', long, default_value_t = 65535, value_parser = clap::value_parser!(i32).range(1..=65535))]
     snaplen: i32,
 
     /// Write matched packets to pcap file
@@ -140,6 +140,15 @@ fn main() -> Result<()> {
         None => None,
     };
 
+    if cli.invert && cli.pattern.is_none() {
+        eprintln!("Warning: -v/--invert with no pattern will match nothing");
+    }
+    if cli.http && cli.no_reassemble {
+        eprintln!(
+            "Warning: --http requires TCP reassembly; it will be ignored with --no-reassemble"
+        );
+    }
+
     if cli.tui {
         if cli.output_file.is_some() {
             eprintln!("Warning: --output-file is not supported in TUI mode and will be ignored");
@@ -162,6 +171,56 @@ fn main() -> Result<()> {
     }
 }
 
+/// Feed a TCP packet's payload to the TLS decryptor (if present).
+fn feed_tls(parsed: &protocol::ParsedPacket, decryptor: &mut Option<tls::TlsDecryptor>) {
+    if parsed.is_tcp() {
+        if let Some(decryptor) = decryptor.as_mut() {
+            if let (Some(key), Some(src_ip), Some(src_port)) =
+                (parsed.stream_key(), parsed.src_ip, parsed.src_port)
+            {
+                decryptor.process_packet(&key, &parsed.payload, src_ip, src_port);
+            }
+        }
+    }
+}
+
+/// Get decrypted TLS payload if available, otherwise return the fallback payload.
+fn resolve_tls_payload(
+    parsed: &protocol::ParsedPacket,
+    decryptor: &mut Option<tls::TlsDecryptor>,
+    fallback: &[u8],
+) -> Vec<u8> {
+    if parsed.is_tcp() {
+        if let Some(decryptor) = decryptor.as_mut() {
+            return parsed
+                .stream_key()
+                .and_then(|key| decryptor.get_decrypted(&key))
+                .unwrap_or_else(|| fallback.to_vec());
+        }
+    }
+    fallback.to_vec()
+}
+
+/// Build a match-text string, using DNS display format when in DNS mode.
+fn build_match_text(payload: &[u8], parsed: &protocol::ParsedPacket, dns_mode: bool) -> String {
+    let payload_str = String::from_utf8_lossy(payload);
+    if dns_mode && parsed.is_dns_port() {
+        protocol::dns::parse_dns(payload)
+            .map(|info| info.display_string())
+            .unwrap_or_else(|| payload_str.to_string())
+    } else {
+        payload_str.to_string()
+    }
+}
+
+/// Check whether text matches the pattern, respecting invert flag.
+fn is_match(text: &str, pattern: &Option<Regex>, invert: bool) -> bool {
+    match pattern {
+        Some(re) => re.is_match(text) != invert,
+        None => !invert,
+    }
+}
+
 fn run_cli_mode(
     cli: &Cli,
     source: &mut PacketSource,
@@ -178,7 +237,7 @@ fn run_cli_mode(
         Some(path) => {
             let file = std::fs::File::create(path)
                 .context(format!("Failed to create output file: {}", path.display()))?;
-            Some(PcapWriter::new(file)?)
+            Some(PcapWriter::new(file, link_type.pcap_link_type())?)
         }
         None => None,
     };
@@ -193,65 +252,37 @@ fn run_cli_mode(
             None => return true,
         };
 
-        // Feed every TCP packet to TLS decryptor incrementally (before reassembly)
-        if parsed.is_tcp() {
-            if let Some(decryptor) = tls_decryptor.as_mut() {
-                if let (Some(key), Some(src_ip), Some(src_port)) =
-                    (parsed.stream_key(), parsed.src_ip, parsed.src_port)
-                {
-                    decryptor.process_packet(&key, &parsed.payload, src_ip, src_port);
-                }
-            }
-        }
+        feed_tls(&parsed, tls_decryptor);
 
         if !cli.no_reassemble && parsed.is_tcp() {
             if let Some(stream_data) = stream_table.process(&parsed) {
-                // Use decrypted plaintext if available, otherwise raw stream data
-                let effective_payload = if let Some(decryptor) = tls_decryptor.as_ref() {
-                    parsed
-                        .stream_key()
-                        .and_then(|key| decryptor.get_decrypted(&key))
-                        .unwrap_or_else(|| stream_data.payload.clone())
-                } else {
-                    stream_data.payload.clone()
-                };
-
+                let effective_payload =
+                    resolve_tls_payload(&parsed, tls_decryptor, &stream_data.payload);
                 let effective_str = String::from_utf8_lossy(&effective_payload);
-                let matched = match &pattern {
-                    Some(re) => re.is_match(&effective_str) != cli.invert,
-                    None => !cli.invert,
-                };
-                if matched {
+                if is_match(&effective_str, pattern, cli.invert) {
                     let display_data = reassembly::StreamData {
                         key: stream_data.key,
                         payload: effective_payload,
                     };
                     formatter.print_stream(&display_data, pattern);
                     if let Some(ref mut writer) = pcap_writer {
-                        let _ = writer.write_packet(packet_data.data, packet_data.timestamp);
+                        if let Err(e) = writer.write_packet(packet_data.data, packet_data.timestamp)
+                        {
+                            eprintln!("Warning: failed to write packet to output file: {}", e);
+                        }
                     }
                     match_count += 1;
                 }
             }
         } else {
-            let match_text = if cli.dns
-                && parsed.transport == protocol::Transport::Udp
-                && parsed.is_dns_port()
-            {
-                protocol::dns::parse_dns(&parsed.payload)
-                    .map(|info| info.display_string())
-                    .unwrap_or_else(|| parsed.payload_str())
-            } else {
-                parsed.payload_str()
-            };
-            let matched = match &pattern {
-                Some(re) => re.is_match(&match_text) != cli.invert,
-                None => !cli.invert,
-            };
-            if matched {
+            let payload = resolve_tls_payload(&parsed, tls_decryptor, &parsed.payload);
+            let match_text = build_match_text(&payload, &parsed, cli.dns);
+            if is_match(&match_text, pattern, cli.invert) {
                 formatter.print_packet(&parsed, pattern);
                 if let Some(ref mut writer) = pcap_writer {
-                    let _ = writer.write_packet(packet_data.data, packet_data.timestamp);
+                    if let Err(e) = writer.write_packet(packet_data.data, packet_data.timestamp) {
+                        eprintln!("Warning: failed to write packet to output file: {}", e);
+                    }
                 }
                 match_count += 1;
             }
@@ -302,34 +333,14 @@ fn run_tui_mode(
                 None => return true,
             };
 
-            // Feed TCP packets to TLS decryptor
-            if parsed.is_tcp() {
-                if let Some(ref mut decryptor) = tls_decryptor {
-                    if let (Some(key), Some(src_ip), Some(src_port)) =
-                        (parsed.stream_key(), parsed.src_ip, parsed.src_port)
-                    {
-                        decryptor.process_packet(&key, &parsed.payload, src_ip, src_port);
-                    }
-                }
-            }
+            feed_tls(&parsed, &mut tls_decryptor);
 
             if reassemble && parsed.is_tcp() {
                 if let Some(stream_data) = stream_table.process(&parsed) {
-                    let effective_payload = if let Some(ref decryptor) = tls_decryptor {
-                        parsed
-                            .stream_key()
-                            .and_then(|key| decryptor.get_decrypted(&key))
-                            .unwrap_or_else(|| stream_data.payload.clone())
-                    } else {
-                        stream_data.payload.clone()
-                    };
-
+                    let effective_payload =
+                        resolve_tls_payload(&parsed, &mut tls_decryptor, &stream_data.payload);
                     let effective_str = String::from_utf8_lossy(&effective_payload);
-                    let matched = match &pattern {
-                        Some(re) => re.is_match(&effective_str) != invert,
-                        None => !invert,
-                    };
-                    if matched {
+                    if is_match(&effective_str, &pattern, invert) {
                         event_id += 1;
                         let display_data = reassembly::StreamData {
                             key: stream_data.key,
@@ -347,21 +358,9 @@ fn run_tui_mode(
                     }
                 }
             } else {
-                let match_text = if dns_mode
-                    && parsed.transport == protocol::Transport::Udp
-                    && parsed.is_dns_port()
-                {
-                    protocol::dns::parse_dns(&parsed.payload)
-                        .map(|info| info.display_string())
-                        .unwrap_or_else(|| parsed.payload_str())
-                } else {
-                    parsed.payload_str()
-                };
-                let matched = match &pattern {
-                    Some(re) => re.is_match(&match_text) != invert,
-                    None => !invert,
-                };
-                if matched {
+                let payload = resolve_tls_payload(&parsed, &mut tls_decryptor, &parsed.payload);
+                let match_text = build_match_text(&payload, &parsed, dns_mode);
+                if is_match(&match_text, &pattern, invert) {
                     event_id += 1;
                     let event = tui::event::CaptureEvent::from_packet(event_id, &parsed, dns_mode);
                     if tx.send(event).is_err() {

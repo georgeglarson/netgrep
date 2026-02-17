@@ -838,7 +838,6 @@ dependencies = [
  "serde",
  "serde_json",
  "simple-dns",
- "thiserror 2.0.18",
  "tls-parser",
 ]
 

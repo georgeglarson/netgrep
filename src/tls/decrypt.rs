@@ -163,6 +163,12 @@ fn hkdf_expand_label(prk: &hkdf::Prk, label: &[u8], context: &[u8], len: usize) 
     // opaque label<7..255> = "tls13 " + label
     // opaque context<0..255>
     let tls_label_len = 6 + label.len(); // "tls13 " prefix
+    if tls_label_len > 255 {
+        return Err(anyhow::anyhow!("HKDF label too long"));
+    }
+    if context.len() > 255 {
+        return Err(anyhow::anyhow!("HKDF context too long"));
+    }
     let info_len = 2 + 1 + tls_label_len + 1 + context.len();
     let mut info = Vec::with_capacity(info_len);
     info.extend_from_slice(&(len as u16).to_be_bytes());

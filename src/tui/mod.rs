@@ -15,6 +15,8 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, 
 
 use event::CaptureEvent;
 
+const MAX_TUI_EVENTS: usize = 100_000;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Table,
@@ -121,7 +123,9 @@ pub fn run_tui(
         loop {
             match rx.try_recv() {
                 Ok(event) => {
-                    app.events.push(event);
+                    if app.events.len() < MAX_TUI_EVENTS {
+                        app.events.push(event);
+                    }
                 }
                 Err(_) => break,
             }
@@ -133,9 +137,7 @@ pub fn run_tui(
         }
 
         // Check if capture thread has stopped
-        if stop_flag.load(Ordering::Relaxed) && !app.capture_running {
-            // Already noted
-        } else if stop_flag.load(Ordering::Relaxed) {
+        if stop_flag.load(Ordering::Relaxed) {
             app.capture_running = false;
         }
 

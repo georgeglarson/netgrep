@@ -35,6 +35,8 @@ struct TlsConnection {
     server_cipher_active: bool,
     /// Accumulated decrypted plaintext from both directions.
     decrypted: Vec<u8>,
+    /// Byte offset up to which decrypted data has been returned to the caller.
+    decrypted_emitted: usize,
 }
 
 impl TlsConnection {
@@ -54,6 +56,7 @@ impl TlsConnection {
             client_cipher_active: false,
             server_cipher_active: false,
             decrypted: Vec::new(),
+            decrypted_emitted: 0,
         }
     }
 
@@ -68,6 +71,7 @@ impl TlsConnection {
 
 const MAX_CONNECTIONS: usize = 10_000;
 const MAX_DECRYPTED_BYTES: usize = 1_048_576; // 1 MB per connection
+const MAX_BUFFER_BYTES: usize = 262_144; // 256 KB per direction buffer
 
 /// Manages TLS decryption across all connections.
 pub struct TlsDecryptor {
@@ -109,21 +113,31 @@ impl TlsDecryptor {
 
         if from_client {
             conn.from_client_buf.extend_from_slice(payload);
+            if conn.from_client_buf.len() > MAX_BUFFER_BYTES {
+                conn.from_client_buf.clear();
+                return;
+            }
         } else {
             conn.from_server_buf.extend_from_slice(payload);
+            if conn.from_server_buf.len() > MAX_BUFFER_BYTES {
+                conn.from_server_buf.clear();
+                return;
+            }
         }
 
         self.drain_buffer(key, from_client, src_ip, src_port);
     }
 
-    /// Get accumulated decrypted plaintext for a connection.
-    /// Returns None if no decrypted data is available.
-    pub fn get_decrypted(&self, key: &StreamKey) -> Option<Vec<u8>> {
-        let conn = self.connections.get(key)?;
-        if conn.decrypted.is_empty() {
+    /// Get new decrypted plaintext since the last call for a connection.
+    /// Returns None if no new decrypted data is available.
+    pub fn get_decrypted(&mut self, key: &StreamKey) -> Option<Vec<u8>> {
+        let conn = self.connections.get_mut(key)?;
+        if conn.decrypted_emitted >= conn.decrypted.len() {
             None
         } else {
-            Some(conn.decrypted.clone())
+            let new_data = conn.decrypted[conn.decrypted_emitted..].to_vec();
+            conn.decrypted_emitted = conn.decrypted.len();
+            Some(new_data)
         }
     }
 

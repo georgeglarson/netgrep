@@ -2,9 +2,9 @@ use colored::Colorize;
 use regex::Regex;
 use serde_json::json;
 
+use crate::protocol::ParsedPacket;
 use crate::protocol::dns::{self, DnsInfo};
 use crate::protocol::http::HttpMessage;
-use crate::protocol::{ParsedPacket, Transport};
 use crate::reassembly::StreamData;
 
 pub struct Formatter {
@@ -27,7 +27,7 @@ impl Formatter {
     }
 
     pub fn print_packet(&self, packet: &ParsedPacket, pattern: &Option<Regex>) {
-        if self.dns && packet.transport == Transport::Udp && packet.is_dns_port() {
+        if self.dns && packet.is_dns_port() {
             if let Some(info) = dns::parse_dns(&packet.payload) {
                 if self.json {
                     self.print_dns_json(packet, &info);
@@ -221,6 +221,10 @@ impl Formatter {
             }
             for r in &info.authorities {
                 let line = format!("  {:<6}{:<40} TTL={} (auth)", r.rtype, r.rdata, r.ttl);
+                print_highlighted(&line, pattern);
+            }
+            for r in &info.additionals {
+                let line = format!("  {:<6}{:<40} TTL={} (add)", r.rtype, r.rdata, r.ttl);
                 print_highlighted(&line, pattern);
             }
         } else {

@@ -82,8 +82,9 @@ impl PacketSource {
                 Ok(packet) => {
                     let ts = {
                         let tv = packet.header.ts;
-                        std::time::UNIX_EPOCH
-                            + std::time::Duration::new(tv.tv_sec as u64, tv.tv_usec as u32 * 1000)
+                        let secs = (tv.tv_sec as i64).max(0) as u64;
+                        let nanos = (tv.tv_usec as i64).max(0) as u32 * 1000;
+                        std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos)
                     };
 
                     let pkt = PacketData {
