@@ -82,7 +82,7 @@ impl CaptureEvent {
         let info = if parsed.payload.is_empty() {
             String::new()
         } else {
-            let s = parsed.payload_str();
+            let s = crate::sanitize::sanitize_control_chars(&parsed.payload_str());
             // First line or truncated preview
             s.lines().next().unwrap_or("").chars().take(80).collect()
         };
@@ -127,7 +127,7 @@ impl CaptureEvent {
             }
         }
 
-        let payload_str = stream.payload_str();
+        let payload_str = crate::sanitize::sanitize_control_chars(&stream.payload_str());
         let info = payload_str
             .lines()
             .next()

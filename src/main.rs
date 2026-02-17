@@ -2,6 +2,7 @@ mod capture;
 mod output;
 mod protocol;
 mod reassembly;
+mod sanitize;
 mod tls;
 mod tui;
 
@@ -284,8 +285,19 @@ fn run_cli_mode(
 
     let mut pcap_writer = match &cli.output_file {
         Some(path) => {
-            let file = std::fs::File::create(path)
-                .context(format!("Failed to create output file: {}", path.display()))?;
+            let file = {
+                let mut opts = std::fs::OpenOptions::new();
+                opts.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    opts.mode(0o600);
+                }
+                opts.open(path).context(format!(
+                    "Failed to create output file (must not already exist): {}",
+                    path.display()
+                ))?
+            };
             Some(PcapWriter::new(file, link_type.pcap_link_type())?)
         }
         None => None,

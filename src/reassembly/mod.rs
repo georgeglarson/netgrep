@@ -260,7 +260,8 @@ impl StreamTable {
     pub fn new() -> Self {
         StreamTable {
             streams: HashMap::new(),
-            max_streams: 10_000,
+            // 5,000 streams * 256 KB * 2 directions = ~2.5 GB worst case
+            max_streams: 5_000,
             max_stream_bytes: 262_144, // 256 KB per stream per direction
             tick: 0,
         }

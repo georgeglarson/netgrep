@@ -75,7 +75,8 @@ impl TlsConnection {
     }
 }
 
-const MAX_CONNECTIONS: usize = 10_000;
+// 5,000 connections * ~1.5 MB (buffers + decrypted) = ~7.5 GB worst case
+const MAX_CONNECTIONS: usize = 5_000;
 const MAX_DECRYPTED_BYTES: usize = 1_048_576; // 1 MB per connection
 const MAX_BUFFER_BYTES: usize = 262_144; // 256 KB per direction buffer
 
@@ -210,6 +211,13 @@ impl TlsDecryptor {
             let record_type = remaining[0];
             if !(0x14..=0x17).contains(&record_type) {
                 // Not a TLS record — discard this direction's buffer
+                offset = buffer.len();
+                break;
+            }
+
+            // Validate TLS version field (bytes 1-2): SSL 3.0 through TLS 1.3
+            let record_version = u16::from_be_bytes([remaining[1], remaining[2]]);
+            if !(0x0300..=0x0304).contains(&record_version) {
                 offset = buffer.len();
                 break;
             }

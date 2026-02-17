@@ -43,7 +43,9 @@ impl<W: Write> PcapWriter<W> {
 
 impl<W: Write> Drop for PcapWriter<W> {
     fn drop(&mut self) {
-        let _ = self.writer.flush();
+        if let Err(e) = self.writer.flush() {
+            eprintln!("Warning: failed to flush pcap output on close: {}", e);
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::Path;
+use zeroize::Zeroize;
 
 /// Secrets extracted from an SSLKEYLOGFILE, keyed by client_random.
 #[derive(Default)]
@@ -11,7 +12,8 @@ pub struct KeyLog {
     pub tls13_secrets: HashMap<[u8; 32], Tls13Secrets>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Zeroize)]
+#[zeroize(drop)]
 pub struct Tls13Secrets {
     pub client_handshake_traffic_secret: Option<Vec<u8>>,
     pub server_handshake_traffic_secret: Option<Vec<u8>>,
@@ -19,6 +21,14 @@ pub struct Tls13Secrets {
     pub server_traffic_secret_0: Option<Vec<u8>>,
     /// L26: Retained for future 0-RTT (early data) decryption support.
     pub client_early_traffic_secret: Option<Vec<u8>>,
+}
+
+impl Drop for KeyLog {
+    fn drop(&mut self) {
+        for secret in self.master_secrets.values_mut() {
+            secret.zeroize();
+        }
+    }
 }
 
 impl KeyLog {

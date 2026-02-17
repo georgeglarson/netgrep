@@ -284,7 +284,8 @@ fn render(frame: &mut ratatui::Frame, app: &mut AppState) {
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ))];
-            for line in ev.detail.body_text().lines() {
+            let body = crate::sanitize::sanitize_control_chars(&ev.detail.body_text());
+            for line in body.lines() {
                 lines.push(Line::from(line.to_string()));
             }
             lines

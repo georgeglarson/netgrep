@@ -312,6 +312,7 @@ mod tests {
 
 /// Print payload with regex matches highlighted in red.
 fn print_highlighted(text: &str, pattern: &Option<Regex>) {
+    let text = &crate::sanitize::sanitize_control_chars(text);
     match pattern {
         Some(re) => {
             let bytes = text.as_bytes();

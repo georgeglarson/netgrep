@@ -2,6 +2,7 @@ use anyhow::Result;
 use ring::aead::{self, LessSafeKey, UnboundKey};
 use ring::hkdf;
 use ring::hmac;
+use zeroize::Zeroize;
 
 /// Derived encryption keys for one direction of a TLS connection.
 pub struct DirectionKeys {
@@ -99,6 +100,12 @@ impl DirectionKeys {
     }
 }
 
+impl Drop for DirectionKeys {
+    fn drop(&mut self) {
+        self.iv.zeroize();
+    }
+}
+
 /// Derive TLS 1.3 keys from a traffic secret using HKDF-Expand-Label.
 pub fn derive_tls13_keys(
     traffic_secret: &[u8],
@@ -108,13 +115,17 @@ pub fn derive_tls13_keys(
     let prk = hkdf::Prk::new_less_safe(hash_algo, traffic_secret);
 
     let key_len = aead_algo.key_len();
-    let key_bytes = hkdf_expand_label(&prk, b"key", b"", key_len)?;
-    let iv_bytes = hkdf_expand_label(&prk, b"iv", b"", 12)?;
+    let mut key_bytes = hkdf_expand_label(&prk, b"key", b"", key_len)?;
+    let mut iv_bytes = hkdf_expand_label(&prk, b"iv", b"", 12)?;
 
     let mut iv = [0u8; 12];
     iv.copy_from_slice(&iv_bytes);
 
-    DirectionKeys::new(&key_bytes, &iv, aead_algo)
+    let result = DirectionKeys::new(&key_bytes, &iv, aead_algo);
+    key_bytes.zeroize();
+    iv_bytes.zeroize();
+    iv.zeroize();
+    result
 }
 
 /// Derive TLS 1.2 keys from master_secret, client_random, server_random.
@@ -136,7 +147,7 @@ pub fn derive_tls12_keys(
     // We need: client_write_key(key_len) + server_write_key(key_len) +
     //          client_write_iv(iv_len) + server_write_iv(iv_len)
     let needed = 2 * key_len + 2 * iv_len;
-    let key_block = tls12_prf(master_secret, b"key expansion", &seed, needed, hmac_algo);
+    let mut key_block = tls12_prf(master_secret, b"key expansion", &seed, needed, hmac_algo);
 
     let mut offset = 0;
     let client_write_key = &key_block[offset..offset + key_len];
@@ -158,10 +169,15 @@ pub fn derive_tls12_keys(
         server_iv[..iv_len].copy_from_slice(&key_block[offset..offset + iv_len]);
     }
 
-    Ok((
+    let result = (
         DirectionKeys::new(client_write_key, &client_iv, aead_algo)?,
         DirectionKeys::new(server_write_key, &server_iv, aead_algo)?,
-    ))
+    );
+    key_block.zeroize();
+    seed.zeroize();
+    client_iv.zeroize();
+    server_iv.zeroize();
+    Ok(result)
 }
 
 /// TLS 1.3 HKDF-Expand-Label (RFC 8446 Section 7.1).
@@ -224,9 +240,14 @@ fn tls12_prf(
         input.extend_from_slice(&a);
         input.extend_from_slice(&label_seed);
         result.extend_from_slice(hmac::sign(&key, &input).as_ref());
-        a = hmac::sign(&key, &a).as_ref().to_vec();
+        let new_a = hmac::sign(&key, &a).as_ref().to_vec();
+        a.zeroize();
+        a = new_a;
+        input.zeroize();
     }
 
+    label_seed.zeroize();
+    a.zeroize();
     result.truncate(out_len);
     result
 }

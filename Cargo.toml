@@ -49,5 +49,8 @@ fluke-hpack = "0.3"
 # Crypto (HKDF, AES-GCM, HMAC for TLS key derivation + decryption)
 ring = "0.17"
 
+# Zeroize sensitive key material on drop
+zeroize = { version = "1", features = ["derive"] }
+
 # Signal handling
 ctrlc = "3"
