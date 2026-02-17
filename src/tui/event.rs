@@ -288,3 +288,258 @@ impl CaptureEvent {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::http::{HttpKind, HttpMessage};
+    use crate::protocol::{ParsedPacket, StreamKey, Transport};
+    use crate::reassembly::{Direction, StreamData};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn make_packet(
+        src_port: Option<u16>,
+        dst_port: Option<u16>,
+        transport: Transport,
+        payload: &[u8],
+    ) -> ParsedPacket {
+        ParsedPacket {
+            src_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            dst_ip: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+            src_port,
+            dst_port,
+            transport,
+            payload: payload.to_vec(),
+            tcp_flags: None,
+            seq: None,
+            vlan_id: None,
+            icmp_type: None,
+            icmp_code: None,
+            timestamp: None,
+        }
+    }
+
+    fn make_stream(payload: &[u8]) -> StreamData {
+        StreamData {
+            key: StreamKey::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                1234,
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                80,
+            ),
+            payload: payload.to_vec(),
+            direction: Direction::Forward,
+            src_addr: (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1234),
+        }
+    }
+
+    fn make_stream_key() -> StreamKey {
+        StreamKey::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            443,
+        )
+    }
+
+    // -- DetailContent tests --
+
+    #[test]
+    fn detail_content_packet_header() {
+        let dc = DetailContent::Packet {
+            header: "test header".into(),
+            payload: b"data".to_vec(),
+        };
+        assert_eq!(dc.header(), "test header");
+    }
+
+    #[test]
+    fn detail_content_stream_approx_bytes() {
+        let dc = DetailContent::Stream {
+            header: "hdr".into(),
+            payload: vec![0u8; 100],
+        };
+        assert_eq!(dc.approx_bytes(), 3 + 100);
+    }
+
+    #[test]
+    fn detail_content_http_body_text() {
+        let dc = DetailContent::Http {
+            header: "h".into(),
+            display: "GET / HTTP/1.1".into(),
+        };
+        assert_eq!(dc.body_text().as_ref(), "GET / HTTP/1.1");
+    }
+
+    #[test]
+    fn detail_content_dns_body_text() {
+        let dc = DetailContent::Dns {
+            header: "dns".into(),
+            display: "Q: example.com A".into(),
+        };
+        assert_eq!(dc.body_text().as_ref(), "Q: example.com A");
+    }
+
+    #[test]
+    fn detail_content_packet_body_text_lossy() {
+        let dc = DetailContent::Packet {
+            header: "h".into(),
+            payload: vec![0xFF, 0xFE, b'a', b'b'],
+        };
+        let text = dc.body_text();
+        assert!(text.contains("ab"));
+    }
+
+    #[test]
+    fn detail_content_stream_header() {
+        let dc = DetailContent::Stream {
+            header: "STREAM 10.0.0.1:1234 <-> 10.0.0.2:80".into(),
+            payload: vec![],
+        };
+        assert_eq!(dc.header(), "STREAM 10.0.0.1:1234 <-> 10.0.0.2:80");
+    }
+
+    // -- format_addr tests --
+
+    #[test]
+    fn format_addr_with_port() {
+        let ip = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(format_addr(ip, Some(8080)), "10.0.0.1:8080");
+    }
+
+    #[test]
+    fn format_addr_without_port() {
+        let ip = Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(format_addr(ip, None), "10.0.0.1");
+    }
+
+    // -- from_packet tests --
+
+    #[test]
+    fn from_packet_tcp_basic() {
+        let pkt = make_packet(Some(1234), Some(80), Transport::Tcp, b"hello");
+        let event = CaptureEvent::from_packet(1, &pkt, false);
+        assert_eq!(event.id, 1);
+        assert_eq!(event.summary.proto, "Tcp");
+        assert!(event.summary.src.contains("10.0.0.1:1234"));
+        assert!(event.summary.dst.contains("10.0.0.2:80"));
+        assert_eq!(event.summary.info, "hello");
+        assert!(event.detail.header().contains("Tcp"));
+    }
+
+    #[test]
+    fn from_packet_udp_basic() {
+        let pkt = make_packet(Some(5000), Some(53), Transport::Udp, b"query");
+        let event = CaptureEvent::from_packet(2, &pkt, false);
+        assert_eq!(event.summary.proto, "Udp");
+    }
+
+    #[test]
+    fn from_packet_empty_payload() {
+        let pkt = make_packet(Some(1234), Some(80), Transport::Tcp, &[]);
+        let event = CaptureEvent::from_packet(3, &pkt, false);
+        assert_eq!(event.summary.info, "");
+        assert!(event.detail.header().contains("0 bytes"));
+    }
+
+    #[test]
+    fn from_packet_dns_mode_on_port_53() {
+        // Build a valid DNS query
+        use simple_dns::{CLASS, Name, Packet, QCLASS, QTYPE, Question, TYPE};
+        let mut pkt_dns = Packet::new_query(0x1234);
+        pkt_dns.questions.push(Question::new(
+            Name::new("example.com").unwrap(),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        let wire = pkt_dns.build_bytes_vec().unwrap();
+
+        let parsed = make_packet(Some(1234), Some(53), Transport::Udp, &wire);
+        let event = CaptureEvent::from_packet(4, &parsed, true);
+        assert_eq!(event.summary.proto, "DNS Q");
+        assert!(event.summary.info.contains("example.com"));
+    }
+
+    #[test]
+    fn from_packet_dns_mode_non_dns_port() {
+        let pkt = make_packet(Some(8080), Some(80), Transport::Tcp, b"not dns");
+        let event = CaptureEvent::from_packet(5, &pkt, true);
+        // Should not be DNS, falls through to regular packet
+        assert_eq!(event.summary.proto, "Tcp");
+    }
+
+    // -- from_stream tests --
+
+    #[test]
+    fn from_stream_basic() {
+        let stream = make_stream(b"stream payload");
+        let event = CaptureEvent::from_stream(1, &stream, false);
+        assert_eq!(event.summary.proto, "TCP");
+        assert!(event.detail.header().contains("STREAM"));
+        assert!(event.detail.header().contains("14 bytes"));
+    }
+
+    #[test]
+    fn from_stream_http_mode_with_http_payload() {
+        let http_payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let stream = make_stream(http_payload);
+        let event = CaptureEvent::from_stream(2, &stream, true);
+        assert_eq!(event.summary.proto, "HTTP");
+        assert!(event.summary.info.contains("GET /"));
+    }
+
+    #[test]
+    fn from_stream_http_mode_non_http_payload() {
+        let stream = make_stream(b"not http content");
+        let event = CaptureEvent::from_stream(3, &stream, true);
+        // Doesn't parse as HTTP, falls through to plain stream
+        assert_eq!(event.summary.proto, "TCP");
+    }
+
+    // -- from_h2_messages tests --
+
+    #[test]
+    fn from_h2_messages_single() {
+        let key = make_stream_key();
+        let msg = HttpMessage {
+            kind: HttpKind::Request {
+                method: "GET".into(),
+                uri: "/api".into(),
+                version: "HTTP/2".into(),
+            },
+            headers: vec![],
+            body: String::new(),
+        };
+        let event = CaptureEvent::from_h2_messages(1, &key, &[msg]);
+        assert_eq!(event.summary.proto, "HTTP");
+        assert!(event.summary.info.contains("GET /api"));
+    }
+
+    #[test]
+    fn from_h2_messages_multiple() {
+        let key = make_stream_key();
+        let msg1 = HttpMessage {
+            kind: HttpKind::Request {
+                method: "GET".into(),
+                uri: "/a".into(),
+                version: "HTTP/2".into(),
+            },
+            headers: vec![],
+            body: String::new(),
+        };
+        let msg2 = HttpMessage {
+            kind: HttpKind::Response {
+                version: "HTTP/2".into(),
+                status: 200,
+                reason: "OK".into(),
+            },
+            headers: vec![],
+            body: String::new(),
+        };
+        let event = CaptureEvent::from_h2_messages(2, &key, &[msg1, msg2]);
+        assert!(event.detail.header().contains("+1 more"));
+        let body = event.detail.body_text();
+        assert!(body.contains("---")); // separator between messages
+    }
+}

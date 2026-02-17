@@ -100,6 +100,12 @@ impl H2Connection {
     }
 }
 
+impl Default for H2Tracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl H2Tracker {
     pub fn new() -> Self {
         H2Tracker {

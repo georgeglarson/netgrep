@@ -1,10 +1,4 @@
-mod capture;
-mod output;
-mod protocol;
-mod reassembly;
-mod sanitize;
-mod tls;
-mod tui;
+#![allow(clippy::uninlined_format_args)]
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -14,10 +8,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use capture::PacketSource;
-use capture::pcap_writer::PcapWriter;
-use output::Formatter;
-use reassembly::StreamTable;
+use netgrep::capture::PacketSource;
+use netgrep::capture::pcap_writer::PcapWriter;
+use netgrep::output::Formatter;
+use netgrep::protocol;
+use netgrep::reassembly::{self, StreamTable};
+use netgrep::tls;
+use netgrep::tui;
 
 #[derive(Parser)]
 #[command(
@@ -590,4 +587,187 @@ fn list_interfaces() -> Result<()> {
         println!("{:<16} {}  [{}]", dev.name, desc, addrs.join(", "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use netgrep::protocol::{ParsedPacket, Transport};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn make_packet(
+        src_port: Option<u16>,
+        dst_port: Option<u16>,
+        transport: Transport,
+        payload: &[u8],
+    ) -> ParsedPacket {
+        ParsedPacket {
+            src_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            dst_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            src_port,
+            dst_port,
+            transport,
+            payload: payload.to_vec(),
+            tcp_flags: None,
+            seq: None,
+            vlan_id: None,
+            icmp_type: None,
+            icmp_code: None,
+            timestamp: None,
+        }
+    }
+
+    // -- is_match tests --
+
+    #[test]
+    fn is_match_pattern_matches() {
+        let re = Some(Regex::new("hello").unwrap());
+        assert!(is_match(b"say hello world", &re, false));
+    }
+
+    #[test]
+    fn is_match_pattern_no_match() {
+        let re = Some(Regex::new("hello").unwrap());
+        assert!(!is_match(b"goodbye world", &re, false));
+    }
+
+    #[test]
+    fn is_match_invert_true_match() {
+        let re = Some(Regex::new("hello").unwrap());
+        // Invert: match becomes false
+        assert!(!is_match(b"hello world", &re, true));
+    }
+
+    #[test]
+    fn is_match_invert_true_no_match() {
+        let re = Some(Regex::new("hello").unwrap());
+        // Invert: no match becomes true
+        assert!(is_match(b"goodbye world", &re, true));
+    }
+
+    #[test]
+    fn is_match_none_pattern() {
+        assert!(is_match(b"anything", &None, false));
+    }
+
+    #[test]
+    fn is_match_none_pattern_invert() {
+        // No pattern + invert = match nothing
+        assert!(!is_match(b"anything", &None, true));
+    }
+
+    #[test]
+    fn is_match_empty_payload() {
+        let re = Some(Regex::new("hello").unwrap());
+        assert!(!is_match(b"", &re, false));
+    }
+
+    #[test]
+    fn is_match_binary_data() {
+        let re = Some(Regex::new(r"\x00\x01").unwrap());
+        assert!(is_match(&[0x00, 0x01, 0x02], &re, false));
+    }
+
+    // -- build_match_text tests --
+
+    #[test]
+    fn build_match_text_non_dns_port() {
+        let pkt = make_packet(Some(8080), Some(80), Transport::Tcp, b"hello");
+        let result = build_match_text(b"hello", &pkt, true);
+        assert_eq!(result, b"hello");
+    }
+
+    #[test]
+    fn build_match_text_dns_mode_false() {
+        let pkt = make_packet(Some(53), Some(1234), Transport::Udp, b"payload");
+        let result = build_match_text(b"payload", &pkt, false);
+        assert_eq!(result, b"payload");
+    }
+
+    #[test]
+    fn build_match_text_dns_port_invalid_dns() {
+        let pkt = make_packet(Some(53), Some(1234), Transport::Udp, b"not-dns");
+        // Invalid DNS payload should fall back to raw bytes
+        let result = build_match_text(b"not-dns", &pkt, true);
+        assert_eq!(result, b"not-dns");
+    }
+
+    #[test]
+    fn build_match_text_dns_query_valid() {
+        // Build a minimal DNS query for "example.com" A record
+        use simple_dns::{CLASS, Name, Packet, QCLASS, QTYPE, Question, TYPE};
+        let mut pkt_dns = Packet::new_query(0x1234);
+        pkt_dns.questions.push(Question::new(
+            Name::new("example.com").unwrap(),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        let wire = pkt_dns.build_bytes_vec().unwrap();
+
+        let parsed = make_packet(Some(1234), Some(53), Transport::Udp, &wire);
+        let result = build_match_text(&wire, &parsed, true);
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("example.com"), "got: {}", result_str);
+    }
+
+    #[test]
+    fn build_match_text_tcp_dns_with_prefix() {
+        // TCP DNS has a 2-byte length prefix
+        use simple_dns::{CLASS, Name, Packet, QCLASS, QTYPE, Question, TYPE};
+        let mut pkt_dns = Packet::new_query(0x5678);
+        pkt_dns.questions.push(Question::new(
+            Name::new("test.org").unwrap(),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        let wire = pkt_dns.build_bytes_vec().unwrap();
+
+        // Prepend 2-byte length prefix for TCP
+        let mut tcp_wire = Vec::new();
+        tcp_wire.extend_from_slice(&(wire.len() as u16).to_be_bytes());
+        tcp_wire.extend_from_slice(&wire);
+
+        let parsed = make_packet(Some(1234), Some(53), Transport::Tcp, &tcp_wire);
+        let result = build_match_text(&tcp_wire, &parsed, true);
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("test.org"), "got: {}", result_str);
+    }
+
+    // -- feed_tls_stream tests --
+
+    #[test]
+    fn feed_tls_stream_none_decryptor_is_noop() {
+        let key = protocol::StreamKey::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            443,
+        );
+        let mut decryptor: Option<tls::TlsDecryptor> = None;
+        // Should not panic
+        feed_tls_stream(
+            &key,
+            b"data",
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            &mut decryptor,
+        );
+    }
+
+    // -- resolve_tls_payload tests --
+
+    #[test]
+    fn resolve_tls_payload_none_decryptor_returns_fallback() {
+        let key = protocol::StreamKey::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            443,
+        );
+        let mut decryptor: Option<tls::TlsDecryptor> = None;
+        let result = resolve_tls_payload(&key, &mut decryptor, b"fallback");
+        assert_eq!(result, b"fallback");
+    }
 }

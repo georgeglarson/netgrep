@@ -2,7 +2,7 @@
 name = "netgrep"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Grep for the network, for a post-TLS world"
 license = "MIT"
 repository = "https://github.com/georgeglarson/netgrep"
@@ -57,3 +57,7 @@ zeroize = { version = "1", features = ["derive"] }
 
 # Signal handling
 ctrlc = "3"
+
+[dev-dependencies]
+etherparse = "0.19"
+simple-dns = "0.11"

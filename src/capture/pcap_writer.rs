@@ -4,12 +4,12 @@ use std::time::SystemTime;
 
 /// Minimal pcap file writer (libpcap format).
 /// Uses native-endian byte order (indicated by magic number 0xa1b2c3d4).
-pub(crate) struct PcapWriter<W: Write> {
+pub struct PcapWriter<W: Write> {
     writer: W,
 }
 
 impl<W: Write> PcapWriter<W> {
-    pub(crate) fn new(mut writer: W, link_type: u32) -> Result<Self> {
+    pub fn new(mut writer: W, link_type: u32) -> Result<Self> {
         // Global header: magic, version 2.4, timezone 0, sigfigs 0, snaplen 65535
         writer.write_all(&0xa1b2c3d4u32.to_ne_bytes())?; // magic
         writer.write_all(&2u16.to_ne_bytes())?; // version_major
@@ -21,7 +21,7 @@ impl<W: Write> PcapWriter<W> {
         Ok(PcapWriter { writer })
     }
 
-    pub(crate) fn write_packet(&mut self, data: &[u8], timestamp: SystemTime) -> Result<()> {
+    pub fn write_packet(&mut self, data: &[u8], timestamp: SystemTime) -> Result<()> {
         let duration = timestamp
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();

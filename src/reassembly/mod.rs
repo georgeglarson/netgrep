@@ -256,6 +256,12 @@ impl StreamData {
     }
 }
 
+impl Default for StreamTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StreamTable {
     pub fn new() -> Self {
         StreamTable {
@@ -275,7 +281,7 @@ impl StreamTable {
 
         // M17: Periodically sweep stale streams to prevent memory leaks
         // from connections that never close cleanly.
-        if self.tick % 10_000 == 0 {
+        if self.tick.is_multiple_of(10_000) {
             self.sweep_stale();
         }
         let key = match packet.stream_key() {
@@ -477,29 +483,29 @@ impl StreamTable {
             .iter()
             .min_by_key(|(_, state)| state.last_active)
             .map(|(key, _)| key.clone());
-        if let Some(key) = oldest_key {
-            if let Some(state) = self.streams.remove(&key) {
-                let mut results = Vec::new();
-                if let Some(p) = state.fwd.drain_all() {
-                    let src = state.src_addr_for(&key, Direction::Forward);
-                    results.push(StreamData {
-                        key: key.clone(),
-                        payload: p,
-                        direction: Direction::Forward,
-                        src_addr: src,
-                    });
-                }
-                if let Some(p) = state.rev.drain_all() {
-                    let src = state.src_addr_for(&key, Direction::Reverse);
-                    results.push(StreamData {
-                        key,
-                        payload: p,
-                        direction: Direction::Reverse,
-                        src_addr: src,
-                    });
-                }
-                return results;
+        if let Some(key) = oldest_key
+            && let Some(state) = self.streams.remove(&key)
+        {
+            let mut results = Vec::new();
+            if let Some(p) = state.fwd.drain_all() {
+                let src = state.src_addr_for(&key, Direction::Forward);
+                results.push(StreamData {
+                    key: key.clone(),
+                    payload: p,
+                    direction: Direction::Forward,
+                    src_addr: src,
+                });
             }
+            if let Some(p) = state.rev.drain_all() {
+                let src = state.src_addr_for(&key, Direction::Reverse);
+                results.push(StreamData {
+                    key,
+                    payload: p,
+                    direction: Direction::Reverse,
+                    src_addr: src,
+                });
+            }
+            return results;
         }
         vec![]
     }

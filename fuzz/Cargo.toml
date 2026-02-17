@@ -1,0 +1,37 @@
+[package]
+name = "netgrep-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata.cargo-fuzz]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+netgrep = { path = ".." }
+
+[[bin]]
+name = "fuzz_parse_http"
+path = "fuzz_targets/fuzz_parse_http.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_parse_dns"
+path = "fuzz_targets/fuzz_parse_dns.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_parse_http2"
+path = "fuzz_targets/fuzz_parse_http2.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_parse_packet"
+path = "fuzz_targets/fuzz_parse_packet.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_keylog"
+path = "fuzz_targets/fuzz_keylog.rs"
+doc = false

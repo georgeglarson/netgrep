@@ -39,7 +39,7 @@ impl KeyLog {
         Self::parse(&contents)
     }
 
-    fn parse(contents: &str) -> Result<Self> {
+    pub fn parse(contents: &str) -> Result<Self> {
         let mut keylog = KeyLog::default();
 
         for line in contents.lines() {
@@ -111,7 +111,7 @@ impl KeyLog {
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 || !s.is_ascii() {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return None;
     }
     (0..s.len())
