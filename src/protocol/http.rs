@@ -58,14 +58,49 @@ impl HttpMessage {
     }
 }
 
-/// Find the byte position of `\r\n\r\n` in a byte slice.
-fn find_header_end(data: &[u8]) -> Option<usize> {
-    data.windows(4).position(|w| w == b"\r\n\r\n")
+/// L18: Find the byte position of the header terminator.
+/// Prefers `\r\n\r\n` but falls back to `\n\n`.
+/// Returns (position, separator_length).
+fn find_header_end(data: &[u8]) -> Option<(usize, usize)> {
+    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some((pos, 4));
+    }
+    if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
+        return Some((pos, 2));
+    }
+    None
 }
 
 /// Find the byte position of `\r\n` in a byte slice.
 fn find_crlf(data: &[u8]) -> Option<usize> {
     data.windows(2).position(|w| w == b"\r\n")
+}
+
+/// Known HTTP methods for M10 request validation.
+const KNOWN_METHODS: &[&str] = &[
+    "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+];
+
+/// M11: Maximum chunked body size (10 MB).
+const MAX_CHUNKED_BODY: usize = 10 * 1024 * 1024;
+
+/// H1: Find the start of the next HTTP message in a byte slice.
+/// Looks for request methods and "HTTP/" response starts.
+fn find_next_http_start(data: &[u8]) -> Option<usize> {
+    for i in 0..data.len() {
+        if data[i..].starts_with(b"HTTP/") {
+            return Some(i);
+        }
+        for method in KNOWN_METHODS {
+            if data[i..].starts_with(method.as_bytes()) {
+                let after = i + method.len();
+                if after < data.len() && data[after] == b' ' {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Try to parse one or more HTTP messages from a stream payload.
@@ -76,13 +111,13 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
     let mut remaining = data;
 
     while !remaining.is_empty() {
-        let header_end = match find_header_end(remaining) {
-            Some(pos) => pos,
+        let (header_end, sep_len) = match find_header_end(remaining) {
+            Some(result) => result,
             None => break,
         };
 
         let header_section = &remaining[..header_end];
-        let after_headers = &remaining[header_end + 4..];
+        let after_headers = &remaining[header_end + sep_len..];
 
         // Headers are text — parse as lossy UTF-8
         let header_text = String::from_utf8_lossy(header_section);
@@ -108,6 +143,10 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
             if parts.len() < 2 {
                 break;
             }
+            // M10: Validate HTTP method against known methods
+            if !KNOWN_METHODS.contains(&parts[0]) {
+                break;
+            }
             HttpKind::Request {
                 method: parts[0].to_string(),
                 uri: parts[1].to_string(),
@@ -115,9 +154,15 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
             }
         };
 
-        let mut headers = Vec::new();
+        // M9: Unfold continuation headers (lines starting with SP/HTAB)
+        let mut headers: Vec<(String, String)> = Vec::new();
         for line in lines {
-            if let Some((key, value)) = line.split_once(':') {
+            if (line.starts_with(' ') || line.starts_with('\t')) && !headers.is_empty() {
+                // Continuation line: append to previous header value
+                let last = headers.last_mut().unwrap();
+                last.1.push(' ');
+                last.1.push_str(line.trim());
+            } else if let Some((key, value)) = line.split_once(':') {
                 headers.push((key.trim().to_string(), value.trim().to_string()));
             }
         }
@@ -148,11 +193,12 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
                 len,
             )
         } else if is_response && !after_headers.is_empty() {
-            // HTTP response with no Content-Length and no Transfer-Encoding:
-            // body extends to end of available data (connection-close semantics).
+            // H1: Close-delimited response — scan for next HTTP message start
+            // before consuming all remaining data.
+            let body_len = find_next_http_start(after_headers).unwrap_or(after_headers.len());
             (
-                String::from_utf8_lossy(after_headers).into_owned(),
-                after_headers.len(),
+                String::from_utf8_lossy(&after_headers[..body_len]).into_owned(),
+                body_len,
             )
         } else {
             (String::new(), 0)
@@ -172,6 +218,7 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
 
 /// Decode a chunked transfer-encoded body from raw bytes.
 /// Returns (decoded_body_bytes, total_bytes_consumed) or None if incomplete.
+/// M11: Enforces MAX_CHUNKED_BODY (10 MB) limit on decoded body size.
 fn decode_chunked(data: &[u8]) -> Option<(Vec<u8>, usize)> {
     let mut decoded = Vec::new();
     let mut pos = 0;
@@ -188,10 +235,22 @@ fn decode_chunked(data: &[u8]) -> Option<(Vec<u8>, usize)> {
         pos += line_end + 2;
 
         if chunk_size == 0 {
-            if let Some(trailer_end) = find_crlf(&data[pos..]) {
-                pos += trailer_end + 2;
+            // L19: Consume trailer headers after zero-size chunk
+            // Trailers are header lines terminated by a final CRLF
+            while let Some(line_end) = find_crlf(&data[pos..]) {
+                pos += line_end + 2;
+                if line_end == 0 {
+                    // Empty line — end of trailers
+                    break;
+                }
+                // Non-empty line — trailer header, continue
             }
             break;
+        }
+
+        // M11: Enforce body size limit
+        if decoded.len() + chunk_size > MAX_CHUNKED_BODY {
+            return None;
         }
 
         if pos + chunk_size > data.len() {
@@ -383,5 +442,111 @@ mod tests {
     fn parse_empty_input() {
         let msgs = parse_http(b"");
         assert!(msgs.is_empty());
+    }
+
+    // --- Phase 5 tests ---
+
+    // H1: Close-delimited response followed by another message
+    #[test]
+    fn close_delimited_response_followed_by_request() {
+        let data = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody hereGET /next HTTP/1.1\r\nHost: b\r\n\r\n";
+        let msgs = parse_http(data);
+        // Should find 2 messages: the response (body up to GET) and the request
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[0].kind, HttpKind::Response { .. }));
+        assert_eq!(msgs[0].body, "body here");
+        assert!(matches!(&msgs[1].kind, HttpKind::Request { .. }));
+    }
+
+    // H1: Close-delimited response followed by another response
+    #[test]
+    fn close_delimited_response_then_response() {
+        let data = b"HTTP/1.1 200 OK\r\n\r\nfirst bodyHTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found";
+        let msgs = parse_http(data);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].body, "first body");
+        match &msgs[1].kind {
+            HttpKind::Response { status, .. } => assert_eq!(*status, 404),
+            _ => panic!("Expected response"),
+        }
+        assert_eq!(msgs[1].body, "not found");
+    }
+
+    // M9: Continuation (folded) headers
+    #[test]
+    fn parse_folded_headers() {
+        let data = b"GET / HTTP/1.1\r\nX-Long-Header: part1\r\n  part2\r\n\tpart3\r\nHost: example.com\r\n\r\n";
+        let msgs = parse_http(data);
+        assert_eq!(msgs.len(), 1);
+        // Folded header should be merged
+        let long_hdr = msgs[0]
+            .headers
+            .iter()
+            .find(|(k, _)| k == "X-Long-Header")
+            .unwrap();
+        assert!(long_hdr.1.contains("part1"));
+        assert!(long_hdr.1.contains("part2"));
+        assert!(long_hdr.1.contains("part3"));
+        // Host should still be separate
+        assert!(msgs[0].headers.iter().any(|(k, _)| k == "Host"));
+    }
+
+    // M10: Invalid HTTP method is rejected
+    #[test]
+    fn parse_invalid_method_rejected() {
+        let data = b"FOOBAR /path HTTP/1.1\r\nHost: x\r\n\r\n";
+        let msgs = parse_http(data);
+        assert!(msgs.is_empty());
+    }
+
+    // M10: All known methods accepted
+    #[test]
+    fn parse_known_methods_accepted() {
+        for method in &[
+            "GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS", "TRACE", "PATCH",
+        ] {
+            let data = format!("{} / HTTP/1.1\r\nHost: x\r\n\r\n", method);
+            let msgs = parse_http(data.as_bytes());
+            assert_eq!(msgs.len(), 1, "Method {} should be accepted", method);
+        }
+    }
+
+    // M11: Chunked body exceeding limit returns None
+    #[test]
+    fn chunked_body_exceeds_limit() {
+        // Create a chunk that would decode to > 10MB
+        let huge_size = MAX_CHUNKED_BODY + 1;
+        let data = format!("{:x}\r\n", huge_size);
+        let mut bytes = data.into_bytes();
+        bytes.extend(vec![b'A'; huge_size]);
+        bytes.extend(b"\r\n0\r\n\r\n");
+        assert!(decode_chunked(&bytes).is_none());
+    }
+
+    // L18: Bare LF header terminator
+    #[test]
+    fn parse_bare_lf_headers() {
+        let data = b"GET / HTTP/1.1\nHost: example.com\n\nbody";
+        let msgs = parse_http(data);
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(&msgs[0].kind, HttpKind::Request { .. }));
+    }
+
+    // L19: Chunked with trailer headers
+    #[test]
+    fn chunked_with_trailers() {
+        let data = b"5\r\nhello\r\n0\r\nTrailer-Key: value\r\n\r\n";
+        let (body, consumed) = decode_chunked(data).unwrap();
+        assert_eq!(body, b"hello");
+        assert_eq!(consumed, data.len());
+    }
+
+    // L19: Chunked with multiple trailer headers
+    #[test]
+    fn chunked_with_multiple_trailers() {
+        let data = b"3\r\nabc\r\n0\r\nX-A: 1\r\nX-B: 2\r\n\r\n";
+        let (body, consumed) = decode_chunked(data).unwrap();
+        assert_eq!(body, b"abc");
+        assert_eq!(consumed, data.len());
     }
 }

@@ -87,10 +87,10 @@ impl PacketSource {
                 Ok(packet) => {
                     let ts = {
                         let tv = packet.header.ts;
-                        let secs = (tv.tv_sec as i64).max(0) as u64;
+                        let secs = tv.tv_sec.max(0) as u64;
                         // tv_usec is microseconds (max 999_999) from libpcap's timeval.
                         // Clamp to valid range to guard against malformed pcap/pcapng files.
-                        let usec = (tv.tv_usec as i64).max(0).min(999_999) as u32;
+                        let usec = tv.tv_usec.clamp(0, 999_999) as u32;
                         std::time::UNIX_EPOCH + std::time::Duration::new(secs, usec * 1000)
                     };
 
@@ -116,16 +116,61 @@ impl PacketSource {
 fn link_type_from_pcap(dl: pcap::Linktype) -> Result<LinkType> {
     match dl.0 {
         1 => Ok(LinkType::Ethernet),     // DLT_EN10MB
-        12 | 101 => Ok(LinkType::RawIp), // DLT_RAW
+        12 | 101 => Ok(LinkType::RawIp), // L28: DLT_RAW (12 = BSD, 101 = LINKTYPE_RAW)
         113 => Ok(LinkType::LinuxSll),   // DLT_LINUX_SLL
         276 => Ok(LinkType::LinuxSll2),  // DLT_LINUX_SLL2
         _ => {
+            // L29: Use "unknown" instead of unwrap_or_default() for clearer error message
             anyhow::bail!(
                 "Unsupported link type: {} (DLT {}). \
                  Supported: Ethernet (1), Raw IP (12/101), Linux SLL (113), Linux SLL2 (276)",
-                dl.get_name().unwrap_or_default(),
+                dl.get_name().unwrap_or("unknown".to_string()),
                 dl.0
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T7: Test link_type_from_pcap with known/unknown DLT values
+    #[test]
+    fn link_type_from_pcap_ethernet() {
+        let lt = link_type_from_pcap(pcap::Linktype(1)).unwrap();
+        assert!(matches!(lt, LinkType::Ethernet));
+    }
+
+    #[test]
+    fn link_type_from_pcap_raw_ip_12() {
+        let lt = link_type_from_pcap(pcap::Linktype(12)).unwrap();
+        assert!(matches!(lt, LinkType::RawIp));
+    }
+
+    #[test]
+    fn link_type_from_pcap_raw_ip_101() {
+        let lt = link_type_from_pcap(pcap::Linktype(101)).unwrap();
+        assert!(matches!(lt, LinkType::RawIp));
+    }
+
+    #[test]
+    fn link_type_from_pcap_linux_sll() {
+        let lt = link_type_from_pcap(pcap::Linktype(113)).unwrap();
+        assert!(matches!(lt, LinkType::LinuxSll));
+    }
+
+    #[test]
+    fn link_type_from_pcap_linux_sll2() {
+        let lt = link_type_from_pcap(pcap::Linktype(276)).unwrap();
+        assert!(matches!(lt, LinkType::LinuxSll2));
+    }
+
+    #[test]
+    fn link_type_from_pcap_unknown_dlt() {
+        let result = link_type_from_pcap(pcap::Linktype(999));
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("DLT 999"));
     }
 }

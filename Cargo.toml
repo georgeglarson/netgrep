@@ -2,6 +2,7 @@
 name = "netgrep"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 description = "Grep for the network, for a post-TLS world"
 license = "MIT"
 repository = "https://github.com/gerg/netgrep"

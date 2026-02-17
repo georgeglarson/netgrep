@@ -49,12 +49,12 @@ struct Cli {
     invert: bool,
 
     /// Output as JSON
-    #[arg(long)]
+    #[arg(long, conflicts_with = "hex")]
     json: bool,
 
-    /// Capture N packets then exit
-    #[arg(short = 'n', long)]
-    count: Option<usize>,
+    /// Capture N matches then exit (1–1048576)
+    #[arg(short = 'n', long, value_parser = clap::value_parser!(u64).range(1..=1048576))]
+    count: Option<u64>,
 
     /// Don't use promiscuous mode
     #[arg(short = 'p', long)]
@@ -92,7 +92,7 @@ struct Cli {
     #[arg(short = 's', long, default_value_t = 65535, value_parser = clap::value_parser!(i32).range(1..=65535))]
     snaplen: i32,
 
-    /// Write matched packets to pcap file
+    /// Write the triggering packet (not the full stream) to pcap file on match
     #[arg(short = 'O', long)]
     output_file: Option<PathBuf>,
 
@@ -162,6 +162,24 @@ fn main() -> Result<()> {
             "Warning: --keylog requires TCP reassembly for TLS decryption; \
              it will not work with --no-reassemble"
         );
+    }
+    // L3: Warn when --dns + --no-reassemble (DNS over TCP won't work)
+    if cli.dns && cli.no_reassemble {
+        eprintln!(
+            "Warning: --dns with --no-reassemble will only match single-packet DNS (typically UDP)"
+        );
+    }
+    // L2: Warn when --tui combined with incompatible output flags
+    if cli.tui {
+        if cli.json {
+            eprintln!("Warning: --json is ignored in TUI mode");
+        }
+        if cli.hex {
+            eprintln!("Warning: --hex is ignored in TUI mode");
+        }
+        if cli.quiet {
+            eprintln!("Warning: --quiet is ignored in TUI mode");
+        }
     }
 
     // --http is a no-op without reassembly; disable it to avoid confusion
@@ -254,7 +272,7 @@ fn run_cli_mode(
 ) -> Result<()> {
     let formatter = Formatter::new(cli.json, cli.hex, cli.quiet, http_mode, cli.dns);
     let mut stream_table = StreamTable::new();
-    let mut match_count: usize = 0;
+    let mut match_count: u64 = 0;
     let mut packets_seen: u64 = 0;
     let link_type = source.link_type();
     let line_buffered = cli.line_buffered;
@@ -287,7 +305,7 @@ fn run_cli_mode(
         parsed.timestamp = Some(packet_data.timestamp);
 
         if !cli.no_reassemble && parsed.is_tcp() {
-            if let Some(stream_data) = stream_table.process(&parsed) {
+            for stream_data in stream_table.process(&parsed) {
                 // Feed TLS decryptor with deduped, in-order stream data
                 if let Some(key) = parsed.stream_key() {
                     let (src_ip, src_port) = direction_src(&parsed, &stream_data.direction);
@@ -315,6 +333,12 @@ fn run_cli_mode(
                         // HTTP/2 messages found — match and display individually
                         let stream_id = key.to_string();
                         for msg in &h2_messages {
+                            // M2: Check count limit inside H2 message loop
+                            if let Some(n) = cli.count
+                                && match_count >= n
+                            {
+                                break;
+                            }
                             let display = msg.display_string();
                             if is_match(display.as_bytes(), pattern, cli.invert) {
                                 if cli.json {
@@ -326,15 +350,14 @@ fn run_cli_mode(
                                     use std::io::Write;
                                     let _ = std::io::stdout().flush();
                                 }
-                                if let Some(ref mut writer) = pcap_writer {
-                                    if let Err(e) =
+                                if let Some(ref mut writer) = pcap_writer
+                                    && let Err(e) =
                                         writer.write_packet(packet_data.data, packet_data.timestamp)
-                                    {
-                                        eprintln!(
-                                            "Warning: failed to write packet to output file: {}",
-                                            e
-                                        );
-                                    }
+                                {
+                                    eprintln!(
+                                        "Warning: failed to write packet to output file: {}",
+                                        e
+                                    );
                                 }
                                 match_count += 1;
                             }
@@ -350,27 +373,20 @@ fn run_cli_mode(
                             use std::io::Write;
                             let _ = std::io::stdout().flush();
                         }
-                        if let Some(ref mut writer) = pcap_writer {
-                            if let Err(e) =
+                        if let Some(ref mut writer) = pcap_writer
+                            && let Err(e) =
                                 writer.write_packet(packet_data.data, packet_data.timestamp)
-                            {
-                                eprintln!("Warning: failed to write packet to output file: {}", e);
-                            }
+                        {
+                            eprintln!("Warning: failed to write packet to output file: {}", e);
                         }
                         match_count += 1;
                     }
                 }
             }
         } else {
-            let payload = if parsed.is_tcp() {
-                if let Some(key) = parsed.stream_key() {
-                    resolve_tls_payload(&key, tls_decryptor, &parsed.payload)
-                } else {
-                    parsed.payload.clone()
-                }
-            } else {
-                parsed.payload.clone()
-            };
+            // M4: Skip TLS resolution in no-reassemble path — TLS decryption
+            // requires reassembled stream data and won't work per-packet.
+            let payload = parsed.payload.clone();
             let match_text = build_match_text(&payload, &parsed, cli.dns);
             if is_match(&match_text, pattern, cli.invert) {
                 formatter.print_packet(&parsed, pattern);
@@ -378,10 +394,10 @@ fn run_cli_mode(
                     use std::io::Write;
                     let _ = std::io::stdout().flush();
                 }
-                if let Some(ref mut writer) = pcap_writer {
-                    if let Err(e) = writer.write_packet(packet_data.data, packet_data.timestamp) {
-                        eprintln!("Warning: failed to write packet to output file: {}", e);
-                    }
+                if let Some(ref mut writer) = pcap_writer
+                    && let Err(e) = writer.write_packet(packet_data.data, packet_data.timestamp)
+                {
+                    eprintln!("Warning: failed to write packet to output file: {}", e);
                 }
                 match_count += 1;
             }
@@ -427,7 +443,8 @@ fn run_tui_mode(
     pattern: Option<Regex>,
     http_mode: bool,
 ) -> Result<()> {
-    let (tx, rx) = crossbeam_channel::unbounded::<tui::event::CaptureEvent>();
+    // M1: Use bounded channel to apply backpressure when TUI can't keep up
+    let (tx, rx) = crossbeam_channel::bounded::<tui::event::CaptureEvent>(10_000);
     let stop_flag = Arc::new(AtomicBool::new(false));
     let packets_seen = Arc::new(AtomicU64::new(0));
 
@@ -442,7 +459,7 @@ fn run_tui_mode(
     let capture_thread = std::thread::spawn(move || -> Result<()> {
         let mut stream_table = StreamTable::new();
         let mut event_id: usize = 0;
-        let mut match_count: usize = 0;
+        let mut match_count: u64 = 0;
         let mut h2_tracker = if http_mode {
             Some(protocol::http2::H2Tracker::new())
         } else {
@@ -463,7 +480,7 @@ fn run_tui_mode(
             parsed.timestamp = Some(packet_data.timestamp);
 
             if reassemble && parsed.is_tcp() {
-                if let Some(stream_data) = stream_table.process(&parsed) {
+                for stream_data in stream_table.process(&parsed) {
                     // Feed TLS with deduped data
                     if let Some(key) = parsed.stream_key() {
                         let (src_ip, src_port) = direction_src(&parsed, &stream_data.direction);
@@ -566,7 +583,9 @@ fn run_tui_mode(
             // TUI exited cleanly but capture had an error — report it
             result.and(Err(e))
         }
-        _ => result,
+        // M5: Handle thread panic
+        Err(_) => result.and(Err(anyhow::anyhow!("capture thread panicked"))),
+        Ok(Ok(())) => result,
     }
 }
 

@@ -17,6 +17,7 @@ pub struct Tls13Secrets {
     pub server_handshake_traffic_secret: Option<Vec<u8>>,
     pub client_traffic_secret_0: Option<Vec<u8>>,
     pub server_traffic_secret_0: Option<Vec<u8>>,
+    /// L26: Retained for future 0-RTT (early data) decryption support.
     pub client_early_traffic_secret: Option<Vec<u8>>,
 }
 
@@ -143,5 +144,70 @@ mod tests {
         let secrets = kl.tls13_secrets.values().next().unwrap();
         assert!(secrets.client_traffic_secret_0.is_some());
         assert!(secrets.server_traffic_secret_0.is_some());
+    }
+
+    // T13: KeyLog edge case tests
+
+    #[test]
+    fn parse_empty_keylog() {
+        let kl = KeyLog::parse("").unwrap();
+        assert!(kl.master_secrets.is_empty());
+        assert!(kl.tls13_secrets.is_empty());
+    }
+
+    #[test]
+    fn parse_comments_and_blank_lines() {
+        let content = "# This is a comment\n\n  # Another comment\n  \n";
+        let kl = KeyLog::parse(content).unwrap();
+        assert!(kl.master_secrets.is_empty());
+        assert!(kl.tls13_secrets.is_empty());
+    }
+
+    #[test]
+    fn parse_malformed_lines_skipped() {
+        let cr = "aa".repeat(32);
+        let secret = "bb".repeat(48);
+        let content = format!(
+            "UNKNOWN_LABEL {} {}\nBAD_FORMAT no_second_field\nTOO FEW\nCLIENT_RANDOM {} {}\n",
+            cr, secret, cr, secret
+        );
+        let kl = KeyLog::parse(&content).unwrap();
+        // Only the valid CLIENT_RANDOM line should be parsed
+        assert_eq!(kl.master_secrets.len(), 1);
+    }
+
+    #[test]
+    fn parse_invalid_hex_skipped() {
+        // Odd-length hex for client_random
+        let content = "CLIENT_RANDOM abc 001122334455\n";
+        let kl = KeyLog::parse(content).unwrap();
+        assert!(kl.master_secrets.is_empty());
+    }
+
+    #[test]
+    fn parse_wrong_length_client_random_skipped() {
+        // Valid hex but not 32 bytes (only 16 bytes = 32 hex chars)
+        let cr_short = "aa".repeat(16);
+        let secret = "bb".repeat(48);
+        let content = format!("CLIENT_RANDOM {} {}\n", cr_short, secret);
+        let kl = KeyLog::parse(&content).unwrap();
+        assert!(kl.master_secrets.is_empty());
+    }
+
+    #[test]
+    fn parse_client_early_traffic_secret() {
+        let cr = "cc".repeat(32);
+        let secret = "dd".repeat(32);
+        let content = format!("CLIENT_EARLY_TRAFFIC_SECRET {} {}\n", cr, secret);
+        let kl = KeyLog::parse(&content).unwrap();
+        assert_eq!(kl.tls13_secrets.len(), 1);
+        let secrets = kl.tls13_secrets.values().next().unwrap();
+        assert!(secrets.client_early_traffic_secret.is_some());
+    }
+
+    #[test]
+    fn keylog_from_nonexistent_file_returns_error() {
+        let result = KeyLog::from_file(std::path::Path::new("/nonexistent/path/keylog.txt"));
+        assert!(result.is_err());
     }
 }

@@ -83,16 +83,8 @@ impl Formatter {
                 (Some(t), Some(c)) => format!("{:?} type={} code={}", packet.transport, t, c),
                 _ => format!("{:?}", packet.transport),
             };
-            let src = format!(
-                "{}:{}",
-                packet.src_ip.map(|i| i.to_string()).unwrap_or_default(),
-                packet.src_port.unwrap_or(0)
-            );
-            let dst = format!(
-                "{}:{}",
-                packet.dst_ip.map(|i| i.to_string()).unwrap_or_default(),
-                packet.dst_port.unwrap_or(0)
-            );
+            let src = format_addr(packet.src_ip, packet.src_port);
+            let dst = format_addr(packet.dst_ip, packet.dst_port);
             let vlan_tag = match packet.vlan_id {
                 Some(id) => format!(" vlan={}", id),
                 None => String::new(),
@@ -198,16 +190,8 @@ impl Formatter {
     }
 
     fn print_dns_text(&self, packet: &ParsedPacket, info: &DnsInfo, pattern: &Option<Regex>) {
-        let src = format!(
-            "{}:{}",
-            packet.src_ip.map(|i| i.to_string()).unwrap_or_default(),
-            packet.src_port.unwrap_or(0)
-        );
-        let dst = format!(
-            "{}:{}",
-            packet.dst_ip.map(|i| i.to_string()).unwrap_or_default(),
-            packet.dst_port.unwrap_or(0)
-        );
+        let src = format_addr(packet.src_ip, packet.src_port);
+        let dst = format_addr(packet.dst_ip, packet.dst_port);
 
         if info.is_response {
             // Response line
@@ -286,6 +270,43 @@ impl Formatter {
             "dns": info,
         });
         println!("{}", j);
+    }
+}
+
+// L7: Show IP only (no `:0`) when port is None.
+fn format_addr(ip: Option<std::net::IpAddr>, port: Option<u16>) -> String {
+    let ip_str = ip.map(|i| i.to_string()).unwrap_or_default();
+    match port {
+        Some(p) => format!("{}:{}", ip_str, p),
+        None => ip_str,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T2: format_addr tests (L7)
+    #[test]
+    fn format_addr_with_port() {
+        let ip = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(format_addr(ip, Some(8080)), "10.0.0.1:8080");
+    }
+
+    #[test]
+    fn format_addr_without_port() {
+        let ip = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)));
+        assert_eq!(format_addr(ip, None), "10.0.0.1");
+    }
+
+    #[test]
+    fn format_addr_no_ip_no_port() {
+        assert_eq!(format_addr(None, None), "");
+    }
+
+    #[test]
+    fn format_addr_no_ip_with_port() {
+        assert_eq!(format_addr(None, Some(80)), ":80");
     }
 }
 

@@ -11,7 +11,9 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// Frame types we handle.
 const FRAME_DATA: u8 = 0x0;
 const FRAME_HEADERS: u8 = 0x1;
+const FRAME_RST_STREAM: u8 = 0x3;
 const FRAME_SETTINGS: u8 = 0x4;
+const FRAME_PUSH_PROMISE: u8 = 0x5;
 const FRAME_CONTINUATION: u8 = 0x9;
 
 /// Frame flags.
@@ -35,6 +37,7 @@ pub enum H2Direction {
 /// Tracks HTTP/2 connections and parses frames into `HttpMessage`s.
 pub struct H2Tracker {
     connections: HashMap<StreamKey, H2Connection>,
+    tick: u64,
 }
 
 struct H2Connection {
@@ -48,6 +51,8 @@ struct H2Connection {
     server_buf: Vec<u8>,
     /// Whether HTTP/2 has been detected (None = unknown, Some(true) = yes, Some(false) = no).
     detected: Option<bool>,
+    /// Monotonic tick for LRU eviction.
+    last_active: u64,
 }
 
 struct H2Stream {
@@ -90,6 +95,7 @@ impl H2Connection {
             client_buf: Vec::new(),
             server_buf: Vec::new(),
             detected: None,
+            last_active: 0,
         }
     }
 }
@@ -98,6 +104,7 @@ impl H2Tracker {
     pub fn new() -> Self {
         H2Tracker {
             connections: HashMap::new(),
+            tick: 0,
         }
     }
 
@@ -113,18 +120,26 @@ impl H2Tracker {
             return vec![];
         }
 
-        // Evict oldest if at capacity
+        self.tick += 1;
+
+        // Evict least-recently-active if at capacity for a new connection
         if !self.connections.contains_key(key) && self.connections.len() >= MAX_CONNECTIONS {
-            // Simple eviction: remove an arbitrary entry
-            if let Some(old_key) = self.connections.keys().next().cloned() {
+            let oldest_key = self
+                .connections
+                .iter()
+                .min_by_key(|(_, conn)| conn.last_active)
+                .map(|(key, _)| key.clone());
+            if let Some(old_key) = oldest_key {
                 self.connections.remove(&old_key);
             }
         }
 
+        let tick = self.tick;
         let conn = self
             .connections
             .entry(key.clone())
             .or_insert_with(H2Connection::new);
+        conn.last_active = tick;
 
         // Append to per-direction buffer
         let buf = match direction {
@@ -133,23 +148,30 @@ impl H2Tracker {
         };
         buf.extend_from_slice(payload);
 
-        // Check for HTTP/2 detection
+        // Check for HTTP/2 detection on either direction buffer (M14)
         if conn.detected.is_none() {
-            // Only check on client-to-server data (preface is from client)
-            if direction == H2Direction::ClientToServer {
-                if conn.client_buf.len() >= H2_PREFACE.len() {
-                    if conn.client_buf.starts_with(H2_PREFACE) {
+            // Check client buffer first (most common), then server
+            for buf in [&mut conn.client_buf as &mut Vec<u8>, &mut conn.server_buf] {
+                if buf.len() >= H2_PREFACE.len() {
+                    if buf.starts_with(H2_PREFACE) {
                         conn.detected = Some(true);
-                        // Skip past the preface
-                        conn.client_buf.drain(..H2_PREFACE.len());
+                        buf.drain(..H2_PREFACE.len());
+                        break;
                     } else {
-                        conn.detected = Some(false);
+                        // Not a match — only reject if this is the client buffer
+                        // (server direction is less likely to have preface)
                     }
-                } else if !H2_PREFACE.starts_with(&conn.client_buf) {
-                    // Partial buffer doesn't match preface prefix — not HTTP/2
-                    conn.detected = Some(false);
+                } else if !buf.is_empty() && !H2_PREFACE.starts_with(buf.as_slice()) {
+                    // Partial buffer doesn't match preface prefix
                 }
-                // else: partial match, wait for more data
+            }
+            // If client buffer has enough data and doesn't match, or partial
+            // buffer doesn't match preface prefix, reject.
+            if conn.detected.is_none()
+                && (conn.client_buf.len() >= H2_PREFACE.len()
+                    || (!conn.client_buf.is_empty() && !H2_PREFACE.starts_with(&conn.client_buf)))
+            {
+                conn.detected = Some(false);
             }
         }
 
@@ -224,14 +246,33 @@ impl H2Tracker {
                     let end_stream = flags & FLAG_END_STREAM != 0;
                     let end_headers = flags & FLAG_END_HEADERS != 0;
 
-                    if stream_id == 0 || conn.streams.len() >= MAX_STREAMS_PER_CONN {
+                    if stream_id == 0 {
+                        continue;
+                    }
+
+                    // C1/H2: Allow existing streams even at limit. For new streams
+                    // at limit, still decode HPACK to keep state consistent.
+                    let is_new = !conn.streams.contains_key(&stream_id);
+                    let at_limit = conn.streams.len() >= MAX_STREAMS_PER_CONN;
+
+                    let header_block = parse_headers_payload(&frame_payload, flags);
+
+                    if is_new && at_limit {
+                        // Must decode HPACK to maintain state, but discard result
+                        if end_headers {
+                            let decoder = match direction {
+                                H2Direction::ClientToServer => &mut conn.client_decoder,
+                                H2Direction::ServerToClient => &mut conn.server_decoder,
+                            };
+                            let _ = decoder.decode(header_block);
+                        }
+                        // No END_HEADERS: track for CONTINUATION decode
+                        // (handled by continuation frame checking streams map)
                         continue;
                     }
 
                     let stream = conn.streams.entry(stream_id).or_insert_with(H2Stream::new);
 
-                    // Parse HEADERS payload: skip padding and priority if present
-                    let header_block = parse_headers_payload(&frame_payload, flags);
                     if stream.header_buf.len() + header_block.len() <= MAX_HEADER_BLOCK {
                         stream.header_buf.extend_from_slice(header_block);
                     }
@@ -242,14 +283,12 @@ impl H2Tracker {
 
                     if end_headers {
                         stream.end_headers = true;
-                        // Decode HPACK
                         let decoder = match direction {
                             H2Direction::ClientToServer => &mut conn.client_decoder,
                             H2Direction::ServerToClient => &mut conn.server_decoder,
                         };
                         decode_headers(stream, decoder);
 
-                        // If END_STREAM was on HEADERS, emit immediately (no body)
                         if stream.end_stream_headers {
                             if let Some(msg) = build_message(stream) {
                                 messages.push(msg);
@@ -282,6 +321,17 @@ impl H2Tracker {
                                 }
                             }
                         }
+                    } else {
+                        // CONTINUATION for a discarded stream — must still decode
+                        // HPACK to keep state consistent
+                        let end_headers = flags & FLAG_END_HEADERS != 0;
+                        if end_headers {
+                            let decoder = match direction {
+                                H2Direction::ClientToServer => &mut conn.client_decoder,
+                                H2Direction::ServerToClient => &mut conn.server_decoder,
+                            };
+                            let _ = decoder.decode(&frame_payload);
+                        }
                     }
                 }
                 FRAME_DATA => {
@@ -291,7 +341,7 @@ impl H2Tracker {
                         // Strip padding if PADDED flag is set
                         let data = if flags & 0x8 != 0 && !frame_payload.is_empty() {
                             let pad_len = frame_payload[0] as usize;
-                            if 1 + pad_len <= frame_payload.len() {
+                            if pad_len < frame_payload.len() {
                                 &frame_payload[1..frame_payload.len() - pad_len]
                             } else {
                                 &[]
@@ -313,11 +363,52 @@ impl H2Tracker {
                         }
                     }
                 }
+                FRAME_RST_STREAM => {
+                    // M13: Remove stream on RST_STREAM
+                    conn.streams.remove(&stream_id);
+                }
+                FRAME_PUSH_PROMISE => {
+                    // C2: Parse PUSH_PROMISE to maintain HPACK state.
+                    // Format: [Pad Length?] [R + Promised Stream ID (4)] [Header Block Fragment] [Padding?]
+                    let mut offset = 0;
+                    let mut end = frame_payload.len();
+
+                    // Handle padding
+                    if flags & 0x8 != 0 {
+                        if frame_payload.is_empty() {
+                            continue;
+                        }
+                        let pad_len = frame_payload[0] as usize;
+                        offset += 1;
+                        if pad_len >= end - offset {
+                            continue;
+                        }
+                        end -= pad_len;
+                    }
+
+                    // Skip promised stream ID (4 bytes)
+                    if offset + 4 > end {
+                        continue;
+                    }
+                    offset += 4;
+
+                    let header_block = &frame_payload[offset..end];
+
+                    // Decode HPACK (discard headers — we don't track pushed streams)
+                    let end_headers = flags & FLAG_END_HEADERS != 0;
+                    if end_headers {
+                        let decoder = match direction {
+                            H2Direction::ClientToServer => &mut conn.client_decoder,
+                            H2Direction::ServerToClient => &mut conn.server_decoder,
+                        };
+                        let _ = decoder.decode(header_block);
+                    }
+                }
                 FRAME_SETTINGS => {
                     // SETTINGS frames are on stream 0; nothing to extract for our purposes.
                 }
                 _ => {
-                    // PRIORITY, RST_STREAM, PUSH_PROMISE, PING, GOAWAY, WINDOW_UPDATE —
+                    // PRIORITY, PING, GOAWAY, WINDOW_UPDATE —
                     // not needed for basic HTTP message extraction.
                 }
             }
@@ -762,5 +853,153 @@ mod tests {
             assert!(!k.starts_with(':'));
         }
         assert_eq!(msgs[0].headers.len(), 2); // content-type, server
+    }
+
+    #[test]
+    fn hpack_consistent_after_stream_limit() {
+        let mut tracker = H2Tracker::new();
+        let key = test_key();
+
+        tracker.process(&key, H2_PREFACE, H2Direction::ClientToServer);
+
+        // Fill up to MAX_STREAMS_PER_CONN
+        for i in 1..=MAX_STREAMS_PER_CONN {
+            let sid = (i * 2 + 1) as u32; // odd stream IDs
+            let header_block = hpack_encode_headers(&[
+                (":method", "GET"),
+                (":path", &format!("/stream/{}", i)),
+                (":scheme", "https"),
+            ]);
+            // No END_STREAM so streams stay open
+            let frame = build_frame(FRAME_HEADERS, FLAG_END_HEADERS, sid, &header_block);
+            tracker.process(&key, &frame, H2Direction::ClientToServer);
+        }
+
+        // At limit now. Try to add one more — should not corrupt HPACK
+        let over_limit_block = hpack_encode_headers(&[
+            (":method", "POST"),
+            (":path", "/over-limit"),
+            (":scheme", "https"),
+        ]);
+        let over_limit_sid = (MAX_STREAMS_PER_CONN * 2 + 3) as u32;
+        let frame = build_frame(
+            FRAME_HEADERS,
+            FLAG_END_STREAM | FLAG_END_HEADERS,
+            over_limit_sid,
+            &over_limit_block,
+        );
+        // This should NOT add the stream but SHOULD decode HPACK
+        let msgs = tracker.process(&key, &frame, H2Direction::ClientToServer);
+        assert!(msgs.is_empty()); // discarded
+
+        // Now close one existing stream so we can add another
+        let rst_frame = build_frame(FRAME_RST_STREAM, 0, 3, &[0, 0, 0, 0]);
+        tracker.process(&key, &rst_frame, H2Direction::ClientToServer);
+
+        // Add a new stream — HPACK should still be consistent
+        let new_block = hpack_encode_headers(&[
+            (":method", "GET"),
+            (":path", "/after-limit"),
+            (":scheme", "https"),
+        ]);
+        let new_sid = (MAX_STREAMS_PER_CONN * 2 + 5) as u32;
+        let frame = build_frame(
+            FRAME_HEADERS,
+            FLAG_END_STREAM | FLAG_END_HEADERS,
+            new_sid,
+            &new_block,
+        );
+        let msgs = tracker.process(&key, &frame, H2Direction::ClientToServer);
+        assert_eq!(msgs.len(), 1);
+        match &msgs[0].kind {
+            HttpKind::Request { uri, .. } => assert_eq!(uri, "/after-limit"),
+            _ => panic!("Expected request"),
+        }
+    }
+
+    #[test]
+    fn rst_stream_removes_stream() {
+        let mut tracker = H2Tracker::new();
+        let key = test_key();
+
+        tracker.process(&key, H2_PREFACE, H2Direction::ClientToServer);
+
+        // Create a stream (no END_STREAM)
+        let header_block = hpack_encode_headers(&[(":status", "200")]);
+        let frame = build_frame(FRAME_HEADERS, FLAG_END_HEADERS, 1, &header_block);
+        tracker.process(&key, &frame, H2Direction::ServerToClient);
+
+        // RST_STREAM should remove it
+        let rst = build_frame(FRAME_RST_STREAM, 0, 1, &[0, 0, 0, 8]); // CANCEL
+        tracker.process(&key, &rst, H2Direction::ServerToClient);
+
+        // Sending DATA on that stream should produce nothing
+        let data = build_frame(FRAME_DATA, FLAG_END_STREAM, 1, b"orphan");
+        let msgs = tracker.process(&key, &data, H2Direction::ServerToClient);
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn push_promise_decoded_for_hpack() {
+        let mut tracker = H2Tracker::new();
+        let key = test_key();
+
+        tracker.process(&key, H2_PREFACE, H2Direction::ClientToServer);
+
+        // Build PUSH_PROMISE frame: [Promised-Stream-ID (4)] + header block
+        let header_block = hpack_encode_headers(&[
+            (":method", "GET"),
+            (":path", "/pushed"),
+            (":scheme", "https"),
+            (":authority", "example.com"),
+        ]);
+        let mut pp_payload = Vec::new();
+        pp_payload.extend_from_slice(&2u32.to_be_bytes()); // promised stream ID = 2
+        pp_payload.extend_from_slice(&header_block);
+
+        let frame = build_frame(FRAME_PUSH_PROMISE, FLAG_END_HEADERS, 1, &pp_payload);
+        let msgs = tracker.process(&key, &frame, H2Direction::ServerToClient);
+        assert!(msgs.is_empty()); // PUSH_PROMISE doesn't emit messages
+
+        // Verify HPACK state is intact by sending another HEADERS
+        let header_block2 = hpack_encode_headers(&[(":status", "200")]);
+        let frame2 = build_frame(
+            FRAME_HEADERS,
+            FLAG_END_STREAM | FLAG_END_HEADERS,
+            1,
+            &header_block2,
+        );
+        let msgs = tracker.process(&key, &frame2, H2Direction::ServerToClient);
+        assert_eq!(msgs.len(), 1);
+    }
+
+    #[test]
+    fn existing_stream_headers_at_limit() {
+        let mut tracker = H2Tracker::new();
+        let key = test_key();
+
+        tracker.process(&key, H2_PREFACE, H2Direction::ClientToServer);
+
+        // Create streams up to limit
+        for i in 1..=MAX_STREAMS_PER_CONN {
+            let sid = (i * 2 + 1) as u32;
+            let hb =
+                hpack_encode_headers(&[(":method", "GET"), (":path", "/"), (":scheme", "https")]);
+            let frame = build_frame(FRAME_HEADERS, FLAG_END_HEADERS, sid, &hb);
+            tracker.process(&key, &frame, H2Direction::ClientToServer);
+        }
+
+        // Sending HEADERS on an existing stream should still work at limit
+        let existing_sid = 3u32;
+        let hb = hpack_encode_headers(&[(":status", "200")]);
+        let frame = build_frame(
+            FRAME_HEADERS,
+            FLAG_END_STREAM | FLAG_END_HEADERS,
+            existing_sid,
+            &hb,
+        );
+        let msgs = tracker.process(&key, &frame, H2Direction::ServerToClient);
+        // This is a response on an existing stream — should be allowed
+        assert_eq!(msgs.len(), 1);
     }
 }

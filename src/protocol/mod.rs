@@ -6,6 +6,10 @@ use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use std::net::IpAddr;
 
 /// Link-layer type of the capture, determines how to parse raw packet bytes.
+/// L15/L16: VLAN extraction is only supported for Ethernet link type.
+/// LinuxSll/LinuxSll2 and RawIp captures do not expose 802.1Q tags;
+/// VLAN ID will always be `None` for these link types.
+/// For DoubleVlan, only the outer VLAN ID is extracted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkType {
     Ethernet,
@@ -234,8 +238,8 @@ pub fn parse_packet(data: &[u8], link_type: LinkType) -> Option<ParsedPacket> {
                     None,
                     None,
                     ip_payload,
-                    Some(itype),
-                    Some(icode),
+                    itype,
+                    icode,
                 )
             }
             Some(TransportSlice::Icmpv6(icmp)) => {
@@ -251,8 +255,8 @@ pub fn parse_packet(data: &[u8], link_type: LinkType) -> Option<ParsedPacket> {
                     None,
                     None,
                     ip_payload,
-                    Some(itype),
-                    Some(icode),
+                    itype,
+                    icode,
                 )
             }
             _ => (
@@ -284,22 +288,23 @@ pub fn parse_packet(data: &[u8], link_type: LinkType) -> Option<ParsedPacket> {
 }
 
 /// Extract ICMPv4 type and code from the slice.
-fn icmpv4_type_code(icmp: &etherparse::Icmpv4Slice) -> (u8, u8) {
+/// L17: Returns (None, None) for truncated ICMP packets instead of (0, 0).
+fn icmpv4_type_code(icmp: &etherparse::Icmpv4Slice) -> (Option<u8>, Option<u8>) {
     let bytes = icmp.slice();
     if bytes.len() >= 2 {
-        (bytes[0], bytes[1])
+        (Some(bytes[0]), Some(bytes[1]))
     } else {
-        (0, 0)
+        (None, None)
     }
 }
 
 /// Extract ICMPv6 type and code from the slice.
-fn icmpv6_type_code(icmp: &etherparse::Icmpv6Slice) -> (u8, u8) {
+fn icmpv6_type_code(icmp: &etherparse::Icmpv6Slice) -> (Option<u8>, Option<u8>) {
     let bytes = icmp.slice();
     if bytes.len() >= 2 {
-        (bytes[0], bytes[1])
+        (Some(bytes[0]), Some(bytes[1]))
     } else {
-        (0, 0)
+        (None, None)
     }
 }
 
@@ -596,5 +601,46 @@ mod tests {
         assert!(flags.fin);
         assert!(flags.ack);
         assert!(!flags.syn);
+    }
+
+    // T9: Tests for normalize_ip (IPv6-mapped IPv4)
+    #[test]
+    fn normalize_ip_v4_passthrough() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(normalize_ip(ip), ip);
+    }
+
+    #[test]
+    fn normalize_ip_v6_passthrough() {
+        let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
+        assert_eq!(normalize_ip(ip), ip);
+    }
+
+    #[test]
+    fn normalize_ip_v6_mapped_v4() {
+        // ::ffff:10.0.0.1 should be normalized to 10.0.0.1
+        let v6 = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001);
+        let result = normalize_ip(IpAddr::V6(v6));
+        assert_eq!(result, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn normalize_ip_v6_mapped_loopback() {
+        // ::ffff:127.0.0.1 should be normalized to 127.0.0.1
+        let v6 = Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001);
+        let result = normalize_ip(IpAddr::V6(v6));
+        assert_eq!(result, IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
+    }
+
+    #[test]
+    fn stream_key_normalizes_mapped_v4() {
+        // A StreamKey from IPv6-mapped-IPv4 should equal one from plain IPv4
+        let v6 = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0x0a00, 0x0001));
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let dst = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+
+        let key_v6 = StreamKey::new(v6, 12345, dst, 80);
+        let key_v4 = StreamKey::new(v4, 12345, dst, 80);
+        assert_eq!(key_v6, key_v4);
     }
 }

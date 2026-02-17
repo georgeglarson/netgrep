@@ -29,8 +29,14 @@ pub struct DnsRecord {
 }
 
 /// Strip the 2-byte TCP DNS length prefix if this is a TCP packet.
-pub fn strip_tcp_prefix<'a>(payload: &'a [u8], is_tcp: bool) -> &'a [u8] {
-    if is_tcp && payload.len() > 2 {
+///
+/// M8: Only returns the first DNS message. TCP DNS may contain multiple
+/// concatenated messages, but in practice (standard recursive queries)
+/// a single message covers 99%+ of traffic. Multi-message TCP DNS
+/// (zone transfers, pipelined queries) is not supported.
+pub fn strip_tcp_prefix(payload: &[u8], is_tcp: bool) -> &[u8] {
+    // L13: >= 2 so that exactly 2 bytes (length-only, no body) is handled
+    if is_tcp && payload.len() >= 2 {
         let dns_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
         if dns_len + 2 <= payload.len() {
             return &payload[2..2 + dns_len];
@@ -156,6 +162,8 @@ fn opcode_to_u8(opcode: OPCODE) -> u8 {
         OPCODE::ServerStatusRequest => 2,
         OPCODE::Notify => 4,
         OPCODE::Update => 5,
+        // L14: Unrecognized opcodes (e.g. DSO=6, future assignments) map to 255
+        // because simple_dns uses a non-exhaustive enum without raw value access.
         _ => 255,
     }
 }
@@ -168,6 +176,8 @@ fn rcode_to_u8(rcode: RCODE) -> u8 {
         RCODE::NameError => 3,
         RCODE::NotImplemented => 4,
         RCODE::Refused => 5,
+        // L14: Unrecognized rcodes (e.g. YXDOMAIN=6, NXRRSET=8, etc.) map to 255
+        // because simple_dns uses a non-exhaustive enum without raw value access.
         _ => 255,
     }
 }

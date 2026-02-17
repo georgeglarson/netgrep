@@ -72,9 +72,12 @@ impl DirectionBuffer {
                     self.flush_reorder_buf(max_bytes);
                     true
                 } else if diff > 0 {
-                    // Gap — buffer for reordering (limit buffer size)
+                    // Gap — buffer for reordering (limit count and bytes)
                     if self.reorder_buf.len() < MAX_REORDER_SEGMENTS {
-                        self.reorder_buf.insert(seq, data.to_vec());
+                        let reorder_bytes: usize = self.reorder_buf.values().map(|v| v.len()).sum();
+                        if self.payload.len() + reorder_bytes + data.len() <= max_bytes {
+                            self.reorder_buf.insert(seq, data.to_vec());
+                        }
                     }
                     false
                 } else {
@@ -106,14 +109,22 @@ impl DirectionBuffer {
 
     /// Drain reorder buffer for segments that are now in order.
     fn flush_reorder_buf(&mut self, max_bytes: usize) {
-        loop {
-            let expected = match self.next_seq {
-                Some(e) => e,
-                None => break,
-            };
+        while let Some(expected) = self.next_seq {
+            // Try direct lookup first — handles seq wrapping correctly since
+            // BTreeMap ordering can break at the u32 boundary, but exact key
+            // lookup always works.
+            if let Some(seg_data) = self.reorder_buf.remove(&expected) {
+                let to_copy = seg_data
+                    .len()
+                    .min(max_bytes.saturating_sub(self.payload.len()));
+                if to_copy > 0 {
+                    self.payload.extend_from_slice(&seg_data[..to_copy]);
+                }
+                self.next_seq = Some(expected.wrapping_add(seg_data.len() as u32));
+                continue;
+            }
 
-            // Find the segment that starts at or before expected
-            // Use the first entry and check if it overlaps with expected
+            // Fallback: check the first entry for overlap with expected
             let next_entry = self.reorder_buf.iter().next().map(|(k, _)| *k);
             match next_entry {
                 Some(seg_seq) => {
@@ -123,33 +134,22 @@ impl DirectionBuffer {
                         break;
                     }
                     let seg_data = self.reorder_buf.remove(&seg_seq).unwrap();
-                    if diff == 0 {
-                        // Exact match
-                        let to_copy = seg_data
+                    // Overlap
+                    let overlap = (-diff) as usize;
+                    if overlap < seg_data.len() {
+                        let new_data = &seg_data[overlap..];
+                        let to_copy = new_data
                             .len()
                             .min(max_bytes.saturating_sub(self.payload.len()));
                         if to_copy > 0 {
-                            self.payload.extend_from_slice(&seg_data[..to_copy]);
+                            self.payload.extend_from_slice(&new_data[..to_copy]);
                         }
-                        self.next_seq = Some(seg_seq.wrapping_add(seg_data.len() as u32));
-                    } else {
-                        // Overlap
-                        let overlap = (-diff) as usize;
-                        if overlap < seg_data.len() {
-                            let new_data = &seg_data[overlap..];
-                            let to_copy = new_data
-                                .len()
-                                .min(max_bytes.saturating_sub(self.payload.len()));
-                            if to_copy > 0 {
-                                self.payload.extend_from_slice(&new_data[..to_copy]);
-                            }
-                            let end = seg_seq.wrapping_add(seg_data.len() as u32);
-                            if seq_after(end, expected) {
-                                self.next_seq = Some(end);
-                            }
+                        let end = seg_seq.wrapping_add(seg_data.len() as u32);
+                        if seq_after(end, expected) {
+                            self.next_seq = Some(end);
                         }
-                        // Full retransmission — discard and continue
                     }
+                    // Full retransmission — discard and continue
                 }
                 None => break,
             }
@@ -188,7 +188,6 @@ const MAX_REORDER_SEGMENTS: usize = 32;
 struct StreamState {
     fwd: DirectionBuffer,
     rev: DirectionBuffer,
-    packets_seen: usize,
     /// Track per-direction FIN: [fwd_fin, rev_fin].
     fin_seen: [bool; 2],
     /// Source address of the connection initiator (SYN sender).
@@ -202,7 +201,6 @@ impl StreamState {
         StreamState {
             fwd: DirectionBuffer::new(),
             rev: DirectionBuffer::new(),
-            packets_seen: 0,
             fin_seen: [false, false],
             initiator: None,
             last_active: 0,
@@ -248,36 +246,67 @@ impl StreamTable {
 
     /// Process a TCP packet. Returns stream data when the stream has new payload
     /// to match against (on PSH or when the stream closes via FIN/RST).
-    /// Emissions are per-direction — only the direction that received data emits.
-    pub fn process(&mut self, packet: &ParsedPacket) -> Option<StreamData> {
+    /// RST emits both directions (forward and reverse) if they have unemitted data.
+    pub fn process(&mut self, packet: &ParsedPacket) -> Vec<StreamData> {
         self.tick += 1;
-        let key = packet.stream_key()?;
-        let flags = packet.tcp_flags?;
+
+        // M17: Periodically sweep stale streams to prevent memory leaks
+        // from connections that never close cleanly.
+        if self.tick % 10_000 == 0 {
+            self.sweep_stale();
+        }
+        let key = match packet.stream_key() {
+            Some(k) => k,
+            None => return vec![],
+        };
+        let flags = match packet.tcp_flags {
+            Some(f) => f,
+            None => return vec![],
+        };
 
         // RST — tear down and emit any unemitted data from both directions
         if flags.rst {
-            return self.streams.remove(&key).and_then(|state| {
-                // Prefer forward unemitted, then reverse
-                state
-                    .fwd
-                    .drain_all()
-                    .map(|p| StreamData {
+            if let Some(state) = self.streams.remove(&key) {
+                let mut results = Vec::new();
+                if let Some(p) = state.fwd.drain_all() {
+                    results.push(StreamData {
                         key: key.clone(),
                         payload: p,
                         direction: Direction::Forward,
-                    })
-                    .or_else(|| {
-                        state.rev.drain_all().map(|p| StreamData {
-                            key,
-                            payload: p,
-                            direction: Direction::Reverse,
-                        })
-                    })
-            });
+                    });
+                }
+                if let Some(p) = state.rev.drain_all() {
+                    results.push(StreamData {
+                        key,
+                        payload: p,
+                        direction: Direction::Reverse,
+                    });
+                }
+                return results;
+            }
+            return vec![];
         }
 
-        // SYN without ACK — new connection
+        // SYN without ACK — new connection (emit old stream data if key exists)
         if flags.syn && !flags.ack {
+            let mut results = Vec::new();
+            // If a stream already exists for this key, emit its data first
+            if let Some(old_state) = self.streams.remove(&key) {
+                if let Some(p) = old_state.fwd.drain_all() {
+                    results.push(StreamData {
+                        key: key.clone(),
+                        payload: p,
+                        direction: Direction::Forward,
+                    });
+                }
+                if let Some(p) = old_state.rev.drain_all() {
+                    results.push(StreamData {
+                        key: key.clone(),
+                        payload: p,
+                        direction: Direction::Reverse,
+                    });
+                }
+            }
             self.evict_if_full();
             let mut state = StreamState::new();
             state.last_active = self.tick;
@@ -287,7 +316,7 @@ impl StreamTable {
             // SYN consumes one sequence number
             state.fwd.next_seq = packet.seq.map(|s| s.wrapping_add(1));
             self.streams.insert(key, state);
-            return None;
+            return results;
         }
 
         // SYN+ACK — record responder's initial sequence number
@@ -296,7 +325,7 @@ impl StreamTable {
                 state.last_active = self.tick;
                 state.rev.next_seq = packet.seq.map(|s| s.wrapping_add(1));
             }
-            return None;
+            return vec![];
         }
 
         // Evict least-recently-active stream if at capacity for a new stream
@@ -309,6 +338,14 @@ impl StreamTable {
             .entry(key.clone())
             .or_insert_with(StreamState::new);
         state.last_active = self.tick;
+
+        // Set initiator from first data packet if not yet known (H6)
+        if state.initiator.is_none()
+            && !packet.payload.is_empty()
+            && let (Some(ip), Some(port)) = (packet.src_ip, packet.src_port)
+        {
+            state.initiator = Some((ip, port));
+        }
 
         let is_fwd = state.is_forward(packet);
         let dir = if is_fwd {
@@ -326,7 +363,11 @@ impl StreamTable {
             };
             let max = self.max_stream_bytes;
 
-            if buf.total_bytes() < max {
+            // Count reorder buffer bytes against max_stream_bytes (M15)
+            let reorder_bytes: usize = buf.reorder_buf.values().map(|v| v.len()).sum();
+            let effective_total = buf.total_bytes() + reorder_bytes;
+
+            if effective_total < max {
                 if let Some(seq) = packet.seq {
                     buf.append(seq, &packet.payload, max);
                 } else {
@@ -339,8 +380,6 @@ impl StreamTable {
                 }
             }
         }
-
-        state.packets_seen += 1;
 
         // Track per-direction FIN
         if flags.fin {
@@ -371,13 +410,27 @@ impl StreamTable {
                 self.streams.remove(&key);
             }
 
-            result
+            match result {
+                Some(sd) => vec![sd],
+                None => vec![],
+            }
         } else {
-            None
+            vec![]
         }
     }
 
+    /// M17: Remove streams that haven't been active for a long time.
+    /// Called periodically (every 10k ticks) to prevent memory leaks.
+    fn sweep_stale(&mut self) {
+        const STALE_THRESHOLD: u64 = 100_000;
+        let current_tick = self.tick;
+        self.streams
+            .retain(|_, state| current_tick.saturating_sub(state.last_active) < STALE_THRESHOLD);
+    }
+
     /// Evict the least-recently-active stream if at capacity.
+    /// M16: This is O(n) over all streams. Acceptable because max_streams
+    /// defaults to 10,000 and eviction is rare (only when at capacity).
     fn evict_if_full(&mut self) {
         if self.streams.len() < self.max_streams {
             return;
@@ -512,21 +565,33 @@ mod tests {
         }
     }
 
+    /// Helper: process and expect exactly one StreamData result.
+    fn process_one(table: &mut StreamTable, pkt: &ParsedPacket) -> StreamData {
+        let mut results = table.process(pkt);
+        assert_eq!(
+            results.len(),
+            1,
+            "expected exactly 1 result, got {}",
+            results.len()
+        );
+        results.remove(0)
+    }
+
     #[test]
     fn basic_stream_reassembly() {
         let mut table = StreamTable::new();
 
         // SYN
         let pkt = make_packet(1234, 80, 100, syn(), &[]);
-        assert!(table.process(&pkt).is_none());
+        assert!(table.process(&pkt).is_empty());
 
         // SYN-ACK (from server)
         let pkt = make_reverse_packet(80, 1234, 200, syn_ack(), &[]);
-        assert!(table.process(&pkt).is_none());
+        assert!(table.process(&pkt).is_empty());
 
         // Data with PSH
         let pkt = make_packet(1234, 80, 101, psh_ack(), b"hello");
-        let data = table.process(&pkt).unwrap();
+        let data = process_one(&mut table, &pkt);
         assert_eq!(data.payload, b"hello");
         assert_eq!(data.direction, Direction::Forward);
     }
@@ -542,12 +607,12 @@ mod tests {
 
         // First data chunk
         let pkt = make_packet(1234, 80, 101, psh_ack(), b"hello ");
-        let data = table.process(&pkt).unwrap();
+        let data = process_one(&mut table, &pkt);
         assert_eq!(data.payload, b"hello ");
 
         // Second data chunk — should only contain NEW data
         let pkt = make_packet(1234, 80, 107, psh_ack(), b"world");
-        let data = table.process(&pkt).unwrap();
+        let data = process_one(&mut table, &pkt);
         assert_eq!(data.payload, b"world");
     }
 
@@ -562,12 +627,12 @@ mod tests {
 
         // Original data
         let pkt = make_packet(1234, 80, 101, psh_ack(), b"hello");
-        let data = table.process(&pkt).unwrap();
+        let data = process_one(&mut table, &pkt);
         assert_eq!(data.payload, b"hello");
 
         // Retransmit of same data — should emit nothing
         let pkt = make_packet(1234, 80, 101, psh_ack(), b"hello");
-        assert!(table.process(&pkt).is_none());
+        assert!(table.process(&pkt).is_empty());
     }
 
     #[test]
@@ -585,9 +650,34 @@ mod tests {
 
         // Partial retransmit: seq=104, len=5 ("lo wo"), overlaps 2 bytes
         let pkt = make_packet(1234, 80, 104, psh_ack(), b"lo wo");
-        let data = table.process(&pkt).unwrap();
+        let data = process_one(&mut table, &pkt);
         // Only the new bytes after expected seq 106
         assert_eq!(data.payload, b" wo");
+    }
+
+    #[test]
+    fn rst_emits_both_directions() {
+        let mut table = StreamTable::new();
+
+        let pkt = make_packet(1234, 80, 100, syn(), &[]);
+        table.process(&pkt);
+        let pkt = make_reverse_packet(80, 1234, 200, syn_ack(), &[]);
+        table.process(&pkt);
+
+        // Data without PSH in both directions — buffered
+        let pkt = make_packet(1234, 80, 101, ack_only(), b"client-data");
+        assert!(table.process(&pkt).is_empty());
+        let pkt = make_reverse_packet(80, 1234, 201, ack_only(), b"server-data");
+        assert!(table.process(&pkt).is_empty());
+
+        // RST — should emit both directions
+        let pkt = make_packet(1234, 80, 112, rst_flags(), &[]);
+        let results = table.process(&pkt);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].payload, b"client-data");
+        assert_eq!(results[0].direction, Direction::Forward);
+        assert_eq!(results[1].payload, b"server-data");
+        assert_eq!(results[1].direction, Direction::Reverse);
     }
 
     #[test]
@@ -601,12 +691,13 @@ mod tests {
 
         // Data without PSH — buffered, not emitted
         let pkt = make_packet(1234, 80, 101, ack_only(), b"buffered");
-        assert!(table.process(&pkt).is_none());
+        assert!(table.process(&pkt).is_empty());
 
         // RST — should emit the buffered data
         let pkt = make_packet(1234, 80, 109, rst_flags(), &[]);
-        let data = table.process(&pkt).unwrap();
-        assert_eq!(data.payload, b"buffered");
+        let results = table.process(&pkt);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].payload, b"buffered");
     }
 
     #[test]
@@ -620,7 +711,7 @@ mod tests {
 
         // Client sends data + FIN
         let pkt = make_packet(1234, 80, 101, fin_ack(), b"bye");
-        let data = table.process(&pkt).unwrap();
+        let data = process_one(&mut table, &pkt);
         assert_eq!(data.payload, b"bye");
 
         // Stream should still exist (only one FIN)
@@ -651,13 +742,13 @@ mod tests {
 
         // Client sends request
         let pkt = make_packet(1234, 80, 101, psh_ack(), b"GET / ");
-        let data = table.process(&pkt).unwrap();
+        let data = process_one(&mut table, &pkt);
         assert_eq!(data.payload, b"GET / ");
         assert_eq!(data.direction, Direction::Forward);
 
         // Server sends response — separate buffer
         let pkt = make_reverse_packet(80, 1234, 201, psh_ack(), b"HTTP/1.1 200 OK");
-        let data = table.process(&pkt).unwrap();
+        let data = process_one(&mut table, &pkt);
         assert_eq!(data.payload, b"HTTP/1.1 200 OK");
         assert_eq!(data.direction, Direction::Reverse);
     }
@@ -673,11 +764,11 @@ mod tests {
 
         // Packet B arrives first (seq=106, "world")
         let pkt = make_packet(1234, 80, 106, ack_only(), b"world");
-        assert!(table.process(&pkt).is_none()); // buffered
+        assert!(table.process(&pkt).is_empty()); // buffered
 
         // Packet A arrives (seq=101, "hello"), fills the gap
         let pkt = make_packet(1234, 80, 101, psh_ack(), b"hello");
-        let data = table.process(&pkt).unwrap();
+        let data = process_one(&mut table, &pkt);
         // Both packets should be in order
         assert_eq!(data.payload, b"helloworld");
     }
@@ -694,16 +785,100 @@ mod tests {
         // Send segments 3, 1, 2 out of order
         // Segment 3: seq=111, "ccc"
         let pkt = make_packet(1234, 80, 111, ack_only(), b"ccc");
-        assert!(table.process(&pkt).is_none());
+        assert!(table.process(&pkt).is_empty());
 
         // Segment 1: seq=101, "aaaaa" — fills gap partially
         let pkt = make_packet(1234, 80, 101, ack_only(), b"aaaaa");
-        assert!(table.process(&pkt).is_none()); // no PSH, not emitted yet
+        assert!(table.process(&pkt).is_empty()); // no PSH, not emitted yet
 
         // Segment 2: seq=106, "bbbbb" — fills remaining gap, flushes segment 3 too
         let pkt = make_packet(1234, 80, 106, psh_ack(), b"bbbbb");
-        let data = table.process(&pkt).unwrap();
+        let data = process_one(&mut table, &pkt);
         assert_eq!(data.payload, b"aaaaabbbbbccc");
+    }
+
+    #[test]
+    fn syn_on_existing_stream_emits_old_data() {
+        let mut table = StreamTable::new();
+
+        // First connection
+        let pkt = make_packet(1234, 80, 100, syn(), &[]);
+        table.process(&pkt);
+        let pkt = make_reverse_packet(80, 1234, 200, syn_ack(), &[]);
+        table.process(&pkt);
+        let pkt = make_packet(1234, 80, 101, ack_only(), b"old-data");
+        table.process(&pkt);
+
+        // New SYN on same key — should emit old stream's data
+        let pkt = make_packet(1234, 80, 500, syn(), &[]);
+        let results = table.process(&pkt);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].payload, b"old-data");
+    }
+
+    #[test]
+    fn initiator_detected_from_first_data_packet() {
+        let mut table = StreamTable::new();
+
+        // Data packet arrives without prior SYN (mid-stream join)
+        let pkt = make_packet(1234, 80, 100, psh_ack(), b"request");
+        let results = table.process(&pkt);
+        assert_eq!(results.len(), 1);
+
+        // Now a packet from the other direction should be detected as reverse
+        let pkt = make_reverse_packet(80, 1234, 200, psh_ack(), b"response");
+        let data = process_one(&mut table, &pkt);
+        assert_eq!(data.direction, Direction::Reverse);
+    }
+
+    #[test]
+    fn seq_after_wrapping() {
+        // Test seq_after at u32 boundary
+        assert!(seq_after(0, u32::MAX)); // 0 is after MAX in TCP seq space
+        assert!(!seq_after(u32::MAX, 0));
+        assert!(seq_after(1, 0));
+        assert!(!seq_after(0, 1));
+        // Same value is not "after"
+        assert!(!seq_after(100, 100));
+    }
+
+    #[test]
+    fn reorder_buffer_respects_byte_limit() {
+        let mut table = StreamTable::new();
+        table.max_stream_bytes = 20; // very small limit
+
+        let pkt = make_packet(1234, 80, 100, syn(), &[]);
+        table.process(&pkt);
+        let pkt = make_reverse_packet(80, 1234, 200, syn_ack(), &[]);
+        table.process(&pkt);
+
+        // Fill in-order buffer with 15 bytes
+        let pkt = make_packet(1234, 80, 101, ack_only(), b"123456789012345");
+        table.process(&pkt);
+
+        // Try to add 10 out-of-order bytes — would exceed limit
+        let pkt = make_packet(1234, 80, 126, ack_only(), b"xxxxxxxxxx");
+        table.process(&pkt);
+
+        // The reorder buffer should have been skipped due to limit
+        let key = StreamKey::new(
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+            1234,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            80,
+        );
+        let state = table.streams.get(&key).unwrap();
+        // In-order data is 15 bytes, reorder_buf would push total over 20
+        assert!(
+            state.fwd.payload.len()
+                + state
+                    .fwd
+                    .reorder_buf
+                    .values()
+                    .map(|v| v.len())
+                    .sum::<usize>()
+                <= 20
+        );
     }
 
     #[test]

@@ -18,6 +18,36 @@ use event::CaptureEvent;
 const MAX_TUI_EVENTS: usize = 100_000;
 const MAX_TUI_BYTES: usize = 256 * 1024 * 1024; // 256 MB total event data
 
+// H7/L11: RAII guard that restores terminal state on drop (normal exit or panic).
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn new() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(stdout(), crossterm::terminal::EnterAlternateScreen)?;
+
+        // Install panic hook that restores terminal
+        let original_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ =
+                crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+            original_hook(info);
+        }));
+
+        Ok(TerminalGuard)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        // Restore the default panic hook
+        let _ = std::panic::take_hook();
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Table,
@@ -28,10 +58,14 @@ struct AppState {
     events: Vec<CaptureEvent>,
     events_bytes: usize,
     table_state: TableState,
+    /// L12: Scroll offset for detail pane. u16 is a ratatui limitation —
+    /// Paragraph::scroll() takes (u16, u16). Max detail scroll is 65535 lines.
     detail_scroll: u16,
     focus: Pane,
     packets_seen: Arc<AtomicU64>,
     capture_running: bool,
+    /// M22: Count of events dropped due to capacity limits.
+    dropped_events: u64,
 }
 
 impl AppState {
@@ -44,6 +78,7 @@ impl AppState {
             focus: Pane::Table,
             packets_seen,
             capture_running: true,
+            dropped_events: 0,
         }
     }
 
@@ -75,6 +110,31 @@ impl AppState {
         self.detail_scroll = 0;
     }
 
+    // L8: Jump 20 rows at a time
+    fn select_page_down(&mut self) {
+        if self.events.is_empty() {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(i) => (i + 20).min(self.events.len() - 1),
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+        self.detail_scroll = 0;
+    }
+
+    fn select_page_up(&mut self) {
+        if self.events.is_empty() {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(i) => i.saturating_sub(20),
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+        self.detail_scroll = 0;
+    }
+
     fn select_first(&mut self) {
         if !self.events.is_empty() {
             self.table_state.select(Some(0));
@@ -95,17 +155,8 @@ pub fn run_tui(
     packets_seen: Arc<AtomicU64>,
     stop_flag: Arc<AtomicBool>,
 ) -> Result<()> {
-    // Set up terminal
-    crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(stdout(), crossterm::terminal::EnterAlternateScreen)?;
-
-    // Panic hook to restore terminal on panic
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = crossterm::terminal::disable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-        original_hook(info);
-    }));
+    // H7/L11: RAII guard handles terminal setup/cleanup, including on panic
+    let _guard = TerminalGuard::new()?;
 
     let backend = CrosstermBackend::new(stdout());
     let mut terminal = Terminal::new(backend)?;
@@ -113,25 +164,22 @@ pub fn run_tui(
 
     loop {
         // Poll for keyboard input (50ms timeout)
-        if crossterm::event::poll(std::time::Duration::from_millis(50))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                if handle_key(&mut app, key, &stop_flag) {
-                    break;
-                }
-            }
+        if crossterm::event::poll(std::time::Duration::from_millis(50))?
+            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
+            && handle_key(&mut app, key, &stop_flag)
+        {
+            break;
         }
 
         // Drain all pending events from channel
         let auto_select = app.events.is_empty();
-        loop {
-            match rx.try_recv() {
-                Ok(event) => {
-                    if app.events.len() < MAX_TUI_EVENTS && app.events_bytes < MAX_TUI_BYTES {
-                        app.events_bytes += event.detail.approx_bytes();
-                        app.events.push(event);
-                    }
-                }
-                Err(_) => break,
+        while let Ok(event) = rx.try_recv() {
+            if app.events.len() < MAX_TUI_EVENTS && app.events_bytes < MAX_TUI_BYTES {
+                app.events_bytes += event.detail.approx_bytes();
+                app.events.push(event);
+            } else {
+                // M22: Track dropped events
+                app.dropped_events += 1;
             }
         }
 
@@ -149,13 +197,7 @@ pub fn run_tui(
         terminal.draw(|frame| render(frame, &mut app))?;
     }
 
-    // Cleanup
-    crossterm::terminal::disable_raw_mode()?;
-    crossterm::execute!(stdout(), crossterm::terminal::LeaveAlternateScreen)?;
-
-    // Restore the default panic hook now that terminal is back to normal
-    let _ = std::panic::take_hook();
-
+    // _guard dropped here, restoring terminal
     Ok(())
 }
 
@@ -266,6 +308,13 @@ fn render(frame: &mut ratatui::Frame, app: &mut AppState) {
     let seen = app.packets_seen.load(Ordering::Relaxed);
     let status_indicator = if app.capture_running { "LIVE" } else { "DONE" };
 
+    // M22: Include dropped count in status bar when non-zero
+    let dropped_str = if app.dropped_events > 0 {
+        format!(" | Dropped: {}", app.dropped_events)
+    } else {
+        String::new()
+    };
+
     let status = Line::from(vec![
         Span::styled(
             format!(" {} ", status_indicator),
@@ -278,8 +327,8 @@ fn render(frame: &mut ratatui::Frame, app: &mut AppState) {
                 }),
         ),
         Span::raw(format!(
-            " Matched: {} | Seen: {} | q:quit  j/k:nav  Tab:focus  Home/End:jump ",
-            matched, seen
+            " Matched: {} | Seen: {}{} | q:quit  j/k:nav  Tab:focus  PgUp/PgDn  Home/End ",
+            matched, seen, dropped_str
         )),
     ]);
 
@@ -330,6 +379,25 @@ fn handle_key(
             };
             false
         }
+        // L8: PageUp/PageDown jump 20 rows in table, 20 lines in detail
+        KeyCode::PageDown => {
+            match app.focus {
+                Pane::Table => app.select_page_down(),
+                Pane::Detail => {
+                    app.detail_scroll = app.detail_scroll.saturating_add(20);
+                }
+            }
+            false
+        }
+        KeyCode::PageUp => {
+            match app.focus {
+                Pane::Table => app.select_page_up(),
+                Pane::Detail => {
+                    app.detail_scroll = app.detail_scroll.saturating_sub(20);
+                }
+            }
+            false
+        }
         KeyCode::Home => {
             match app.focus {
                 Pane::Table => app.select_first(),
@@ -348,5 +416,118 @@ fn handle_key(
             false
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_event(id: usize) -> CaptureEvent {
+        CaptureEvent {
+            id,
+            summary: event::RowSummary {
+                proto: "TCP".into(),
+                src: "1.2.3.4:1000".into(),
+                dst: "5.6.7.8:80".into(),
+                info: format!("event {}", id),
+            },
+            detail: event::DetailContent::Packet {
+                header: format!("Test event {}", id),
+                payload: vec![0x41; 10],
+            },
+        }
+    }
+
+    fn make_app_with_events(n: usize) -> AppState {
+        let seen = Arc::new(AtomicU64::new(0));
+        let mut app = AppState::new(seen);
+        for i in 0..n {
+            app.events.push(make_test_event(i + 1));
+        }
+        if n > 0 {
+            app.table_state.select(Some(0));
+        }
+        app
+    }
+
+    // T8: AppState navigation boundaries
+    #[test]
+    fn select_next_clamps_at_end() {
+        let mut app = make_app_with_events(3);
+        app.table_state.select(Some(2)); // last item
+        app.select_next();
+        assert_eq!(app.table_state.selected(), Some(2)); // stays at end
+    }
+
+    #[test]
+    fn select_prev_clamps_at_start() {
+        let mut app = make_app_with_events(3);
+        app.table_state.select(Some(0)); // first item
+        app.select_prev();
+        assert_eq!(app.table_state.selected(), Some(0)); // stays at start
+    }
+
+    #[test]
+    fn select_next_on_empty() {
+        let mut app = make_app_with_events(0);
+        app.select_next();
+        assert_eq!(app.table_state.selected(), None);
+    }
+
+    #[test]
+    fn select_prev_on_empty() {
+        let mut app = make_app_with_events(0);
+        app.select_prev();
+        assert_eq!(app.table_state.selected(), None);
+    }
+
+    #[test]
+    fn select_first_and_last() {
+        let mut app = make_app_with_events(5);
+        app.select_last();
+        assert_eq!(app.table_state.selected(), Some(4));
+        app.select_first();
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn page_down_jumps_20() {
+        let mut app = make_app_with_events(50);
+        app.table_state.select(Some(0));
+        app.select_page_down();
+        assert_eq!(app.table_state.selected(), Some(20));
+    }
+
+    #[test]
+    fn page_up_jumps_20() {
+        let mut app = make_app_with_events(50);
+        app.table_state.select(Some(30));
+        app.select_page_up();
+        assert_eq!(app.table_state.selected(), Some(10));
+    }
+
+    #[test]
+    fn page_down_clamps_at_end() {
+        let mut app = make_app_with_events(10);
+        app.table_state.select(Some(5));
+        app.select_page_down();
+        assert_eq!(app.table_state.selected(), Some(9)); // last item
+    }
+
+    #[test]
+    fn page_up_clamps_at_start() {
+        let mut app = make_app_with_events(10);
+        app.table_state.select(Some(5));
+        app.select_page_up();
+        assert_eq!(app.table_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn detail_scroll_resets_on_nav() {
+        let mut app = make_app_with_events(5);
+        app.detail_scroll = 42;
+        app.select_next();
+        assert_eq!(app.detail_scroll, 0);
     }
 }

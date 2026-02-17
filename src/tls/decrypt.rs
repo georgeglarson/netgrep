@@ -30,7 +30,7 @@ impl DirectionKeys {
     /// For TLS 1.2, the additional_data is: seq(8) + type(1) + version(2) + length(2).
     pub fn decrypt_record(
         &mut self,
-        ciphertext: &mut Vec<u8>,
+        ciphertext: &mut [u8],
         additional_data: &[u8],
     ) -> Result<Vec<u8>> {
         let nonce = self.build_nonce();
@@ -59,7 +59,7 @@ impl DirectionKeys {
     /// The full nonce is: implicit_iv[0..4] || explicit_nonce[0..8].
     pub fn decrypt_tls12_record(
         &mut self,
-        ciphertext: &mut Vec<u8>,
+        ciphertext: &mut [u8],
         additional_data: &[u8],
         explicit_nonce: &[u8],
     ) -> Result<Vec<u8>> {
@@ -112,6 +112,7 @@ pub fn derive_tls13_keys(
 }
 
 /// Derive TLS 1.2 keys from master_secret, client_random, server_random.
+/// `hmac_algo` selects SHA-256 or SHA-384 for the PRF, matching the cipher suite.
 pub fn derive_tls12_keys(
     master_secret: &[u8],
     client_random: &[u8; 32],
@@ -119,6 +120,7 @@ pub fn derive_tls12_keys(
     key_len: usize,
     iv_len: usize,
     aead_algo: &'static aead::Algorithm,
+    hmac_algo: hmac::Algorithm,
 ) -> Result<(DirectionKeys, DirectionKeys)> {
     let mut seed = Vec::with_capacity(64);
     seed.extend_from_slice(server_random);
@@ -128,7 +130,7 @@ pub fn derive_tls12_keys(
     // We need: client_write_key(key_len) + server_write_key(key_len) +
     //          client_write_iv(iv_len) + server_write_iv(iv_len)
     let needed = 2 * key_len + 2 * iv_len;
-    let key_block = prf_sha256(master_secret, b"key expansion", &seed, needed);
+    let key_block = tls12_prf(master_secret, b"key expansion", &seed, needed, hmac_algo);
 
     let mut offset = 0;
     let client_write_key = &key_block[offset..offset + key_len];
@@ -189,9 +191,16 @@ fn hkdf_expand_label(prk: &hkdf::Prk, label: &[u8], context: &[u8], len: usize) 
     Ok(out)
 }
 
-/// TLS 1.2 PRF using HMAC-SHA256.
-fn prf_sha256(secret: &[u8], label: &[u8], seed: &[u8], out_len: usize) -> Vec<u8> {
-    let key = hmac::Key::new(hmac::HMAC_SHA256, secret);
+/// TLS 1.2 PRF (RFC 5246 Section 5).
+/// `algo` selects the HMAC: SHA-256 for most suites, SHA-384 for AES-256-GCM.
+fn tls12_prf(
+    secret: &[u8],
+    label: &[u8],
+    seed: &[u8],
+    out_len: usize,
+    algo: hmac::Algorithm,
+) -> Vec<u8> {
+    let key = hmac::Key::new(algo, secret);
     let mut label_seed = Vec::with_capacity(label.len() + seed.len());
     label_seed.extend_from_slice(label);
     label_seed.extend_from_slice(seed);
@@ -299,5 +308,101 @@ mod tests {
     fn seq_num_starts_at_zero() {
         let keys = make_keys([0u8; 12]);
         assert_eq!(keys.seq_num(), 0);
+    }
+
+    #[test]
+    fn tls12_prf_sha256_produces_deterministic_output() {
+        let secret = [0x42u8; 48];
+        let seed = [0xAA; 64];
+        let result1 = tls12_prf(&secret, b"key expansion", &seed, 72, hmac::HMAC_SHA256);
+        let result2 = tls12_prf(&secret, b"key expansion", &seed, 72, hmac::HMAC_SHA256);
+        assert_eq!(result1.len(), 72);
+        assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn tls12_prf_sha384_produces_different_output() {
+        let secret = [0x42u8; 48];
+        let seed = [0xAA; 64];
+        let sha256_result = tls12_prf(&secret, b"key expansion", &seed, 72, hmac::HMAC_SHA256);
+        let sha384_result = tls12_prf(&secret, b"key expansion", &seed, 72, hmac::HMAC_SHA384);
+        assert_eq!(sha384_result.len(), 72);
+        // SHA-256 and SHA-384 PRF must produce different key material
+        assert_ne!(sha256_result, sha384_result);
+    }
+
+    #[test]
+    fn aes256_gcm_tls12_roundtrip() {
+        // Verify AES-256-GCM with SHA-384 PRF produces valid keys
+        let master_secret = [0x55u8; 48];
+        let client_random = [0x11u8; 32];
+        let server_random = [0x22u8; 32];
+
+        let (mut client_keys, server_keys) = derive_tls12_keys(
+            &master_secret,
+            &client_random,
+            &server_random,
+            32, // AES-256 key length
+            4,  // GCM implicit IV
+            &aead::AES_256_GCM,
+            hmac::HMAC_SHA384,
+        )
+        .unwrap();
+
+        // Encrypt with client keys, decrypt with server keys (simulate)
+        // Just verify keys were derived without error and seq starts at 0
+        assert_eq!(client_keys.seq_num(), 0);
+        assert_eq!(server_keys.seq_num(), 0);
+
+        // Encrypt a message using client_keys
+        use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey};
+        let plaintext = b"hello AES-256-GCM with SHA-384 PRF";
+
+        // Build explicit nonce (8 bytes) for TLS 1.2 GCM
+        let explicit_nonce = [0x01u8; 8];
+        let mut full_nonce = [0u8; 12];
+        full_nonce[..4].copy_from_slice(&client_keys.iv[..4]);
+        full_nonce[4..].copy_from_slice(&explicit_nonce);
+
+        // Build AAD: seq(8) + type(1) + version(2) + plaintext_len(2)
+        let mut aad_bytes = Vec::with_capacity(13);
+        aad_bytes.extend_from_slice(&0u64.to_be_bytes());
+        aad_bytes.push(0x17); // application data
+        aad_bytes.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+        aad_bytes.extend_from_slice(&(plaintext.len() as u16).to_be_bytes());
+
+        // Encrypt
+        let _unbound = UnboundKey::new(&aead::AES_256_GCM, &[0u8; 32]).ok(); // we need the actual key
+        // Instead, just verify derive_tls12_keys succeeded and decrypt_tls12_record works
+        // by encrypting with the derived key and decrypting it back
+        let mut ct = plaintext.to_vec();
+        let sealing_unbound = UnboundKey::new(&aead::AES_256_GCM, &{
+            // Re-derive to get key bytes - use the same PRF
+            let mut seed = Vec::with_capacity(64);
+            seed.extend_from_slice(&server_random);
+            seed.extend_from_slice(&client_random);
+            let kb = tls12_prf(
+                &master_secret,
+                b"key expansion",
+                &seed,
+                72,
+                hmac::HMAC_SHA384,
+            );
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&kb[..32]);
+            key
+        })
+        .unwrap();
+        let sealing_key = LessSafeKey::new(sealing_unbound);
+        let nonce = Nonce::try_assume_unique_for_key(&full_nonce).unwrap();
+        sealing_key
+            .seal_in_place_append_tag(nonce, Aad::from(&aad_bytes), &mut ct)
+            .unwrap();
+
+        // Decrypt using client_keys
+        let result = client_keys
+            .decrypt_tls12_record(&mut ct, &aad_bytes, &explicit_nonce)
+            .unwrap();
+        assert_eq!(result, plaintext);
     }
 }

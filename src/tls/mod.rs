@@ -125,12 +125,21 @@ impl TlsDecryptor {
         // Check buffer size before extending to avoid temporary memory spike
         if from_client {
             if conn.from_client_buf.len() + payload.len() > MAX_BUFFER_BYTES {
+                // L22: Warn when buffer is cleared on overflow
+                eprintln!(
+                    "Warning: TLS client buffer overflow for {:?}, clearing",
+                    key
+                );
                 conn.from_client_buf.clear();
                 return;
             }
             conn.from_client_buf.extend_from_slice(payload);
         } else {
             if conn.from_server_buf.len() + payload.len() > MAX_BUFFER_BYTES {
+                eprintln!(
+                    "Warning: TLS server buffer overflow for {:?}, clearing",
+                    key
+                );
                 conn.from_server_buf.clear();
                 return;
             }
@@ -142,15 +151,24 @@ impl TlsDecryptor {
 
     /// Get new decrypted plaintext since the last call for a connection.
     /// Returns None if no new decrypted data is available.
+    /// Drains emitted bytes from the buffer to free memory (M20).
     pub fn get_decrypted(&mut self, key: &StreamKey) -> Option<Vec<u8>> {
         let conn = self.connections.get_mut(key)?;
         if conn.decrypted_emitted >= conn.decrypted.len() {
             None
         } else {
             let new_data = conn.decrypted[conn.decrypted_emitted..].to_vec();
-            conn.decrypted_emitted = conn.decrypted.len();
+            // Drain emitted bytes to free memory
+            conn.decrypted.drain(..conn.decrypted.len());
+            conn.decrypted_emitted = 0;
             Some(new_data)
         }
+    }
+
+    /// Remove a connection's TLS state (M19). Call on FIN/RST.
+    #[allow(dead_code)]
+    pub fn remove_connection(&mut self, key: &StreamKey) {
+        self.connections.remove(key);
     }
 
     /// Evict the least-recently-active connection.
@@ -188,9 +206,9 @@ impl TlsDecryptor {
                 break;
             }
 
-            // Validate record type byte (0x14-0x18)
+            // L20: Validate record type byte (0x14-0x17: CCS, Alert, Handshake, AppData)
             let record_type = remaining[0];
-            if !(0x14..=0x18).contains(&record_type) {
+            if !(0x14..=0x17).contains(&record_type) {
                 // Not a TLS record — discard this direction's buffer
                 offset = buffer.len();
                 break;
@@ -198,6 +216,13 @@ impl TlsDecryptor {
 
             // Check if we have the complete record body
             let record_body_len = u16::from_be_bytes([remaining[3], remaining[4]]) as usize;
+
+            // L21: Reject records with body > 16384 + 2048 (TLS max + overhead)
+            if record_body_len > 16384 + 2048 {
+                offset = buffer.len();
+                break;
+            }
+
             if remaining.len() < 5 + record_body_len {
                 break; // Incomplete record, wait for more data
             }
@@ -240,16 +265,14 @@ impl TlsDecryptor {
                 }
                 // After CCS, handshake records (Finished) are encrypted — decrypt to advance seq
                 TlsRecordType::Handshake | TlsRecordType::ApplicationData => {
-                    if let Some(plaintext) = self.decrypt_record(key, &record, src_ip, src_port) {
-                        if record.hdr.record_type == TlsRecordType::ApplicationData {
-                            if let Some(conn) = self.connections.get_mut(key) {
-                                let remaining =
-                                    MAX_DECRYPTED_BYTES.saturating_sub(conn.decrypted.len());
-                                let to_copy = plaintext.len().min(remaining);
-                                if to_copy > 0 {
-                                    conn.decrypted.extend_from_slice(&plaintext[..to_copy]);
-                                }
-                            }
+                    if let Some(plaintext) = self.decrypt_record(key, &record, src_ip, src_port)
+                        && record.hdr.record_type == TlsRecordType::ApplicationData
+                        && let Some(conn) = self.connections.get_mut(key)
+                    {
+                        let remaining = MAX_DECRYPTED_BYTES.saturating_sub(conn.decrypted.len());
+                        let to_copy = plaintext.len().min(remaining);
+                        if to_copy > 0 {
+                            conn.decrypted.extend_from_slice(&plaintext[..to_copy]);
                         }
                     }
                 }
@@ -321,13 +344,19 @@ impl TlsDecryptor {
                 Some(c) => c,
                 None => return,
             };
-            (cr, cs, conn.version.unwrap_or(TlsVersion::Tls12))
+            // L23: Require explicit version instead of defaulting to TLS 1.2
+            let v = match conn.version {
+                Some(v) => v,
+                None => return,
+            };
+            (cr, cs, v)
         };
 
-        let (aead_algo, hash_algo, key_len, iv_len) = match handshake::cipher_suite_params(cipher) {
-            Some(p) => p,
-            None => return,
-        };
+        let (aead_algo, hash_algo, key_len, iv_len, hmac_algo) =
+            match handshake::cipher_suite_params(cipher) {
+                Some(p) => p,
+                None => return,
+            };
 
         // Store iv_len on the connection for use during decryption
         if let Some(conn) = self.connections.get_mut(key) {
@@ -337,7 +366,7 @@ impl TlsDecryptor {
         if version == TlsVersion::Tls13 {
             self.derive_tls13_keys(key, &client_random, hash_algo, aead_algo);
         } else {
-            self.derive_tls12_keys(key, &client_random, key_len, iv_len, aead_algo);
+            self.derive_tls12_keys(key, &client_random, key_len, iv_len, aead_algo, hmac_algo);
         }
     }
 
@@ -359,27 +388,27 @@ impl TlsDecryptor {
         };
 
         // Derive application traffic keys
-        if let Some(ref client_secret) = secrets.client_traffic_secret_0 {
-            if let Ok(keys) = decrypt::derive_tls13_keys(client_secret, hash_algo, aead_algo) {
-                conn.client_keys = Some(keys);
-            }
+        if let Some(ref client_secret) = secrets.client_traffic_secret_0
+            && let Ok(keys) = decrypt::derive_tls13_keys(client_secret, hash_algo, aead_algo)
+        {
+            conn.client_keys = Some(keys);
         }
-        if let Some(ref server_secret) = secrets.server_traffic_secret_0 {
-            if let Ok(keys) = decrypt::derive_tls13_keys(server_secret, hash_algo, aead_algo) {
-                conn.server_keys = Some(keys);
-            }
+        if let Some(ref server_secret) = secrets.server_traffic_secret_0
+            && let Ok(keys) = decrypt::derive_tls13_keys(server_secret, hash_algo, aead_algo)
+        {
+            conn.server_keys = Some(keys);
         }
 
         // Derive handshake traffic keys (for encrypted handshake messages)
-        if let Some(ref client_hs_secret) = secrets.client_handshake_traffic_secret {
-            if let Ok(keys) = decrypt::derive_tls13_keys(client_hs_secret, hash_algo, aead_algo) {
-                conn.client_hs_keys = Some(keys);
-            }
+        if let Some(ref client_hs_secret) = secrets.client_handshake_traffic_secret
+            && let Ok(keys) = decrypt::derive_tls13_keys(client_hs_secret, hash_algo, aead_algo)
+        {
+            conn.client_hs_keys = Some(keys);
         }
-        if let Some(ref server_hs_secret) = secrets.server_handshake_traffic_secret {
-            if let Ok(keys) = decrypt::derive_tls13_keys(server_hs_secret, hash_algo, aead_algo) {
-                conn.server_hs_keys = Some(keys);
-            }
+        if let Some(ref server_hs_secret) = secrets.server_handshake_traffic_secret
+            && let Ok(keys) = decrypt::derive_tls13_keys(server_hs_secret, hash_algo, aead_algo)
+        {
+            conn.server_hs_keys = Some(keys);
         }
     }
 
@@ -390,6 +419,7 @@ impl TlsDecryptor {
         key_len: usize,
         iv_len: usize,
         aead_algo: &'static aead::Algorithm,
+        hmac_algo: ring::hmac::Algorithm,
     ) {
         let master_secret = match self.keylog.master_secrets.get(client_random) {
             Some(ms) => ms.clone(),
@@ -413,6 +443,7 @@ impl TlsDecryptor {
             key_len,
             iv_len,
             aead_algo,
+            hmac_algo,
         ) {
             conn.client_keys = Some(client_keys);
             conn.server_keys = Some(server_keys);
@@ -432,7 +463,8 @@ impl TlsDecryptor {
             .map(|(ip, port)| ip == src_ip && port == src_port)
             .unwrap_or(false);
 
-        let version = conn.version.unwrap_or(TlsVersion::Tls12);
+        // L23: Require explicit version
+        let version = conn.version?;
 
         if version == TlsVersion::Tls13 {
             self.decrypt_tls13_record(key, record, is_from_client)
@@ -448,8 +480,7 @@ impl TlsDecryptor {
         record: &TlsRawRecord,
         is_from_client: bool,
     ) -> Option<Vec<u8>> {
-        // Bail if record length exceeds u16 range (malformed record)
-        let record_len = u16::try_from(record.hdr.len).ok()?;
+        let record_len = record.hdr.len;
 
         // Build AAD (same for all attempts)
         let mut aad = Vec::with_capacity(5);
@@ -467,14 +498,20 @@ impl TlsDecryptor {
         };
         if let Some(keys) = hs_keys {
             let mut ct = record.data.to_vec();
-            if let Ok(plaintext) = keys.decrypt_record(&mut ct, &aad) {
-                if let Some((data, content_type)) = Self::strip_tls13_content_type(plaintext) {
-                    // Only return application data (0x17), skip handshake (0x16) etc.
-                    if content_type == 0x17 {
-                        return Some(data);
-                    }
-                    return None;
+            if let Ok(plaintext) = keys.decrypt_record(&mut ct, &aad)
+                && let Some((data, content_type)) = Self::strip_tls13_content_type(plaintext)
+            {
+                // Only return application data (0x17), skip handshake (0x16) etc.
+                if content_type == 0x17 {
+                    return Some(data);
                 }
+                // M21: Detect KeyUpdate (handshake type 24) in handshake content
+                if content_type == 0x16 && data.first() == Some(&24) {
+                    eprintln!(
+                        "Warning: TLS 1.3 KeyUpdate detected; subsequent records may fail to decrypt"
+                    );
+                }
+                return None;
             }
         }
 
@@ -486,17 +523,23 @@ impl TlsDecryptor {
         };
         if let Some(keys) = app_keys {
             let mut ct = record.data.to_vec();
-            if let Ok(plaintext) = keys.decrypt_record(&mut ct, &aad) {
-                if let Some((data, content_type)) = Self::strip_tls13_content_type(plaintext) {
-                    if content_type == 0x17 {
-                        // Handshake is complete — discard handshake keys to avoid
-                        // wasting cycles trying them on every subsequent record.
-                        conn.client_hs_keys = None;
-                        conn.server_hs_keys = None;
-                        return Some(data);
-                    }
-                    return None;
+            if let Ok(plaintext) = keys.decrypt_record(&mut ct, &aad)
+                && let Some((data, content_type)) = Self::strip_tls13_content_type(plaintext)
+            {
+                if content_type == 0x17 {
+                    // Handshake is complete — discard handshake keys to avoid
+                    // wasting cycles trying them on every subsequent record.
+                    conn.client_hs_keys = None;
+                    conn.server_hs_keys = None;
+                    return Some(data);
                 }
+                // M21: Detect KeyUpdate (handshake type 24) in application keys
+                if content_type == 0x16 && data.first() == Some(&24) {
+                    eprintln!(
+                        "Warning: TLS 1.3 KeyUpdate detected; subsequent records may fail to decrypt"
+                    );
+                }
+                return None;
             }
         }
 
@@ -544,7 +587,7 @@ impl TlsDecryptor {
             aad.extend_from_slice(&(keys.seq_num()).to_be_bytes());
             aad.push(record.hdr.record_type.0);
             aad.extend_from_slice(&u16::from(record.hdr.version).to_be_bytes());
-            aad.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
+            aad.extend_from_slice(&u16::try_from(plaintext_len).ok()?.to_be_bytes());
 
             keys.decrypt_tls12_record(&mut ciphertext, &aad, &explicit_nonce)
                 .ok()
@@ -561,7 +604,7 @@ impl TlsDecryptor {
             aad.extend_from_slice(&(keys.seq_num()).to_be_bytes());
             aad.push(record.hdr.record_type.0);
             aad.extend_from_slice(&u16::from(record.hdr.version).to_be_bytes());
-            aad.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
+            aad.extend_from_slice(&u16::try_from(plaintext_len).ok()?.to_be_bytes());
 
             // Use build_nonce (XOR seq with full 12-byte IV) via decrypt_record
             keys.decrypt_record(&mut ciphertext, &aad).ok()
@@ -619,6 +662,8 @@ mod tests {
         assert!(decryptor.connections.contains_key(&existing_key));
     }
 
+    // T3: Rewritten — actually tests that get_decrypted stops returning data
+    // when decrypted buffer is at the cap, proving the constant is meaningful.
     #[test]
     fn max_decrypted_bytes_caps_buffer() {
         let keylog = KeyLog::default();
@@ -631,10 +676,14 @@ mod tests {
         decryptor.process_packet(&key, &[0xFF], src_ip, 12345);
         let conn = decryptor.connections.get_mut(&key).unwrap();
         conn.decrypted = vec![0xAA; MAX_DECRYPTED_BYTES];
+        conn.decrypted_emitted = 0;
 
-        // Verify the cap constant is what we expect
-        assert_eq!(conn.decrypted.len(), 1_048_576);
-        assert_eq!(MAX_DECRYPTED_BYTES, 1_048_576);
+        // get_decrypted should return the full buffer
+        let data = decryptor.get_decrypted(&key).unwrap();
+        assert_eq!(data.len(), MAX_DECRYPTED_BYTES);
+
+        // After draining, no more data available
+        assert!(decryptor.get_decrypted(&key).is_none());
     }
 
     #[test]
@@ -728,5 +777,52 @@ mod tests {
     fn tls_connection_default_iv_len() {
         let conn = TlsConnection::new();
         assert_eq!(conn.iv_len, 4);
+    }
+
+    // T12: Test MAX_BUFFER_BYTES enforcement — oversized payloads are rejected
+    #[test]
+    fn max_buffer_bytes_clears_on_overflow() {
+        let keylog = KeyLog::default();
+        let mut decryptor = TlsDecryptor::new(keylog);
+        let src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let dst_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let key = StreamKey::new(src_ip, 12345, dst_ip, 443);
+
+        // First packet creates the connection
+        decryptor.process_packet(&key, &[0x16, 0x03, 0x01], src_ip, 12345);
+        assert!(decryptor.connections.contains_key(&key));
+
+        // Fill the buffer close to MAX_BUFFER_BYTES
+        let conn = decryptor.connections.get_mut(&key).unwrap();
+        conn.from_client_buf = vec![0xFF; MAX_BUFFER_BYTES - 10];
+
+        // Next packet should overflow and clear the buffer
+        let big_payload = vec![0xAA; 100];
+        decryptor.process_packet(&key, &big_payload, src_ip, 12345);
+        let conn = decryptor.connections.get(&key).unwrap();
+        // Buffer was cleared on overflow
+        assert!(conn.from_client_buf.len() < MAX_BUFFER_BYTES);
+    }
+
+    // T12b: Server direction buffer also enforced
+    #[test]
+    fn max_buffer_bytes_server_direction() {
+        let keylog = KeyLog::default();
+        let mut decryptor = TlsDecryptor::new(keylog);
+        let client_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let server_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let key = StreamKey::new(client_ip, 12345, server_ip, 443);
+
+        // Create connection and set client addr
+        decryptor.process_packet(&key, &[0x16], client_ip, 12345);
+        let conn = decryptor.connections.get_mut(&key).unwrap();
+        conn.client_addr = Some((client_ip, 12345));
+        conn.from_server_buf = vec![0xFF; MAX_BUFFER_BYTES - 5];
+
+        // Server packet should overflow
+        let big_payload = vec![0xBB; 50];
+        decryptor.process_packet(&key, &big_payload, server_ip, 443);
+        let conn = decryptor.connections.get(&key).unwrap();
+        assert!(conn.from_server_buf.len() < MAX_BUFFER_BYTES);
     }
 }

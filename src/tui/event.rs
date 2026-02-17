@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::protocol::ParsedPacket;
 use crate::protocol::dns::{self, DnsInfo};
 use crate::protocol::http::{self, HttpMessage};
@@ -43,22 +45,24 @@ impl DetailContent {
         }
     }
 
-    pub fn body_text(&self) -> String {
+    // L5: Return Cow<str> to avoid allocation when the content is already a String.
+    pub fn body_text(&self) -> Cow<'_, str> {
         match self {
-            DetailContent::Packet { payload, .. } => String::from_utf8_lossy(payload).into_owned(),
-            DetailContent::Stream { payload, .. } => String::from_utf8_lossy(payload).into_owned(),
-            DetailContent::Http { display, .. } => display.clone(),
-            DetailContent::Dns { display, .. } => display.clone(),
+            DetailContent::Packet { payload, .. } => String::from_utf8_lossy(payload),
+            DetailContent::Stream { payload, .. } => String::from_utf8_lossy(payload),
+            DetailContent::Http { display, .. } => Cow::Borrowed(display),
+            DetailContent::Dns { display, .. } => Cow::Borrowed(display),
         }
     }
 }
 
+// L7: Show IP only (no `:0`) when port is None.
 fn format_addr(ip: Option<std::net::IpAddr>, port: Option<u16>) -> String {
-    format!(
-        "{}:{}",
-        ip.map(|i| i.to_string()).unwrap_or_default(),
-        port.unwrap_or(0)
-    )
+    let ip_str = ip.map(|i| i.to_string()).unwrap_or_default();
+    match port {
+        Some(p) => format!("{}:{}", ip_str, p),
+        None => ip_str,
+    }
 }
 
 impl CaptureEvent {
@@ -226,8 +230,25 @@ impl CaptureEvent {
         stream_id: &str,
         messages: &[HttpMessage],
     ) -> Self {
-        // Summary shows the first message's info
-        let first = &messages[0];
+        // L6: Guard for empty messages slice
+        let first = match messages.first() {
+            Some(f) => f,
+            None => {
+                return CaptureEvent {
+                    id,
+                    summary: RowSummary {
+                        proto: "HTTP".into(),
+                        src: src.to_string(),
+                        dst: dst.to_string(),
+                        info: String::new(),
+                    },
+                    detail: DetailContent::Http {
+                        header: format!("HTTP {} (empty)", stream_id),
+                        display: String::new(),
+                    },
+                };
+            }
+        };
         let info = match &first.kind {
             crate::protocol::http::HttpKind::Request { method, uri, .. } => {
                 format!("{} {}", method, uri)
