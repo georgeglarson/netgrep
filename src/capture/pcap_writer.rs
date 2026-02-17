@@ -26,12 +26,16 @@ impl<W: Write> PcapWriter<W> {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
 
-        self.writer
-            .write_all(&(duration.as_secs() as u32).to_ne_bytes())?; // ts_sec
-        self.writer
-            .write_all(&duration.subsec_micros().to_ne_bytes())?; // ts_usec
-        self.writer.write_all(&(data.len() as u32).to_ne_bytes())?; // incl_len
-        self.writer.write_all(&(data.len() as u32).to_ne_bytes())?; // orig_len
+        // pcap format uses u32 for ts_sec (wraps after 2106-02-07).
+        // Truncation is inherent to the format; use wrapping cast.
+        let ts_sec = duration.as_secs() as u32;
+        let ts_usec = duration.subsec_micros();
+        let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+
+        self.writer.write_all(&ts_sec.to_ne_bytes())?;
+        self.writer.write_all(&ts_usec.to_ne_bytes())?;
+        self.writer.write_all(&len.to_ne_bytes())?; // incl_len
+        self.writer.write_all(&len.to_ne_bytes())?; // orig_len
         self.writer.write_all(data)?;
         Ok(())
     }

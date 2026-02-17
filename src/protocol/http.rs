@@ -131,6 +131,8 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case("transfer-encoding") && v.contains("chunked"));
 
+        let is_response = matches!(kind, HttpKind::Response { .. });
+
         let (body, consumed) = if is_chunked {
             match decode_chunked(after_headers) {
                 Some((decoded, bytes_consumed)) => (
@@ -139,12 +141,21 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
                 ),
                 None => (String::new(), 0),
             }
-        } else {
-            let len = content_length.unwrap_or(0).min(after_headers.len());
+        } else if let Some(cl) = content_length {
+            let len = cl.min(after_headers.len());
             (
                 String::from_utf8_lossy(&after_headers[..len]).into_owned(),
                 len,
             )
+        } else if is_response && !after_headers.is_empty() {
+            // HTTP response with no Content-Length and no Transfer-Encoding:
+            // body extends to end of available data (connection-close semantics).
+            (
+                String::from_utf8_lossy(after_headers).into_owned(),
+                after_headers.len(),
+            )
+        } else {
+            (String::new(), 0)
         };
 
         remaining = &after_headers[consumed..];

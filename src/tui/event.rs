@@ -33,6 +33,16 @@ impl DetailContent {
         }
     }
 
+    /// Approximate heap size of the detail content in bytes.
+    pub fn approx_bytes(&self) -> usize {
+        match self {
+            DetailContent::Packet { header, payload } => header.len() + payload.len(),
+            DetailContent::Stream { header, payload } => header.len() + payload.len(),
+            DetailContent::Http { header, display } => header.len() + display.len(),
+            DetailContent::Dns { header, display } => header.len() + display.len(),
+        }
+    }
+
     pub fn body_text(&self) -> String {
         match self {
             DetailContent::Packet { payload, .. } => String::from_utf8_lossy(payload).into_owned(),
@@ -41,6 +51,17 @@ impl DetailContent {
             DetailContent::Dns { display, .. } => display.clone(),
         }
     }
+}
+
+/// Strip the 2-byte TCP DNS length prefix if this is a TCP packet.
+fn dns_payload<'a>(payload: &'a [u8], is_tcp: bool) -> &'a [u8] {
+    if is_tcp && payload.len() > 2 {
+        let dns_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+        if dns_len + 2 <= payload.len() {
+            return &payload[2..2 + dns_len];
+        }
+    }
+    payload
 }
 
 fn format_addr(ip: Option<std::net::IpAddr>, port: Option<u16>) -> String {
@@ -56,9 +77,10 @@ impl CaptureEvent {
         let src = format_addr(parsed.src_ip, parsed.src_port);
         let dst = format_addr(parsed.dst_ip, parsed.dst_port);
 
-        // Check for DNS
+        // Check for DNS (strip 2-byte TCP length prefix if needed)
         if dns_mode && parsed.is_dns_port() {
-            if let Some(info) = dns::parse_dns(&parsed.payload) {
+            let dns_data = dns_payload(&parsed.payload, parsed.is_tcp());
+            if let Some(info) = dns::parse_dns(dns_data) {
                 return Self::from_dns(id, &src, &dst, &info);
             }
         }

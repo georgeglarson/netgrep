@@ -69,7 +69,7 @@ impl StreamTable {
         StreamTable {
             streams: HashMap::new(),
             max_streams: 10_000,
-            max_stream_bytes: 1_048_576, // 1 MB per stream
+            max_stream_bytes: 262_144, // 256 KB per stream
             tick: 0,
         }
     }
@@ -223,18 +223,28 @@ impl StreamTable {
 /// treated as retransmissions and dropped. True out-of-order reassembly would
 /// require a reorder buffer, which is not implemented.
 fn deduplicate<'a>(seq: u32, payload: &'a [u8], expected: u32) -> &'a [u8] {
-    // How many bytes of this segment overlap with already-seen data?
-    let overlap = expected.wrapping_sub(seq) as i32;
+    if seq == expected {
+        // Common fast path: exact match
+        return payload;
+    }
 
-    if overlap <= 0 {
-        // Packet starts at or after expected position (exact or gap) — all new
+    // Use signed sequence-space arithmetic to distinguish "ahead" from "behind".
+    // Positive diff means seq is ahead of expected (gap); negative means behind (overlap).
+    let diff = seq.wrapping_sub(expected) as i32;
+
+    if diff > 0 {
+        // Packet starts after expected (gap) — accept all data
         payload
-    } else if (overlap as usize) < payload.len() {
-        // Partial retransmission — skip the already-seen prefix
-        &payload[overlap as usize..]
     } else {
-        // Full retransmission — nothing new
-        &[]
+        // Packet starts at or before expected (overlap/retransmission)
+        let overlap = (-diff) as usize;
+        if overlap < payload.len() {
+            // Partial retransmission — skip the already-seen prefix
+            &payload[overlap..]
+        } else {
+            // Full retransmission — nothing new
+            &[]
+        }
     }
 }
 

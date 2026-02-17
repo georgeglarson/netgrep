@@ -199,6 +199,12 @@ impl DnsInfo {
             out.push(' ');
         }
 
+        // Trim trailing space before rcode to avoid double-space
+        let trimmed_len = out.trim_end().len();
+        out.truncate(trimmed_len);
+        if !out.is_empty() {
+            out.push(' ');
+        }
         out.push_str(rcode_str(self.rcode));
         out
     }

@@ -91,7 +91,7 @@ impl KeyLog {
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if s.len() % 2 != 0 || !s.is_ascii() {
         return None;
     }
     (0..s.len())

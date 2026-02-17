@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, 
 use event::CaptureEvent;
 
 const MAX_TUI_EVENTS: usize = 100_000;
+const MAX_TUI_BYTES: usize = 256 * 1024 * 1024; // 256 MB total event data
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -25,6 +26,7 @@ enum Pane {
 
 struct AppState {
     events: Vec<CaptureEvent>,
+    events_bytes: usize,
     table_state: TableState,
     detail_scroll: u16,
     focus: Pane,
@@ -36,6 +38,7 @@ impl AppState {
     fn new(packets_seen: Arc<AtomicU64>) -> Self {
         AppState {
             events: Vec::new(),
+            events_bytes: 0,
             table_state: TableState::default(),
             detail_scroll: 0,
             focus: Pane::Table,
@@ -123,7 +126,8 @@ pub fn run_tui(
         loop {
             match rx.try_recv() {
                 Ok(event) => {
-                    if app.events.len() < MAX_TUI_EVENTS {
+                    if app.events.len() < MAX_TUI_EVENTS && app.events_bytes < MAX_TUI_BYTES {
+                        app.events_bytes += event.detail.approx_bytes();
                         app.events.push(event);
                     }
                 }
@@ -148,6 +152,9 @@ pub fn run_tui(
     // Cleanup
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(stdout(), crossterm::terminal::LeaveAlternateScreen)?;
+
+    // Restore the default panic hook now that terminal is back to normal
+    let _ = std::panic::take_hook();
 
     Ok(())
 }

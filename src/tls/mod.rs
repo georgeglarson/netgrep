@@ -37,6 +37,8 @@ struct TlsConnection {
     decrypted: Vec<u8>,
     /// Byte offset up to which decrypted data has been returned to the caller.
     decrypted_emitted: usize,
+    /// Monotonic tick updated on each packet for LRU eviction.
+    last_active: u64,
 }
 
 impl TlsConnection {
@@ -57,6 +59,7 @@ impl TlsConnection {
             server_cipher_active: false,
             decrypted: Vec::new(),
             decrypted_emitted: 0,
+            last_active: 0,
         }
     }
 
@@ -77,6 +80,7 @@ const MAX_BUFFER_BYTES: usize = 262_144; // 256 KB per direction buffer
 pub struct TlsDecryptor {
     keylog: KeyLog,
     connections: HashMap<StreamKey, TlsConnection>,
+    tick: u64,
 }
 
 impl TlsDecryptor {
@@ -84,6 +88,7 @@ impl TlsDecryptor {
         TlsDecryptor {
             keylog,
             connections: HashMap::new(),
+            tick: 0,
         }
     }
 
@@ -100,29 +105,33 @@ impl TlsDecryptor {
             return;
         }
 
-        // Skip if at capacity and this is a new connection
+        self.tick += 1;
+
+        // Evict least-recently-active connection if at capacity for a new one
         if !self.connections.contains_key(key) && self.connections.len() >= MAX_CONNECTIONS {
-            return;
+            self.evict_oldest();
         }
 
         let conn = self
             .connections
             .entry(key.clone())
             .or_insert_with(TlsConnection::new);
+        conn.last_active = self.tick;
         let from_client = conn.is_from_client(src_ip, src_port);
 
+        // Check buffer size before extending to avoid temporary memory spike
         if from_client {
-            conn.from_client_buf.extend_from_slice(payload);
-            if conn.from_client_buf.len() > MAX_BUFFER_BYTES {
+            if conn.from_client_buf.len() + payload.len() > MAX_BUFFER_BYTES {
                 conn.from_client_buf.clear();
                 return;
             }
+            conn.from_client_buf.extend_from_slice(payload);
         } else {
-            conn.from_server_buf.extend_from_slice(payload);
-            if conn.from_server_buf.len() > MAX_BUFFER_BYTES {
+            if conn.from_server_buf.len() + payload.len() > MAX_BUFFER_BYTES {
                 conn.from_server_buf.clear();
                 return;
             }
+            conn.from_server_buf.extend_from_slice(payload);
         }
 
         self.drain_buffer(key, from_client, src_ip, src_port);
@@ -138,6 +147,18 @@ impl TlsDecryptor {
             let new_data = conn.decrypted[conn.decrypted_emitted..].to_vec();
             conn.decrypted_emitted = conn.decrypted.len();
             Some(new_data)
+        }
+    }
+
+    /// Evict the least-recently-active connection.
+    fn evict_oldest(&mut self) {
+        let oldest_key = self
+            .connections
+            .iter()
+            .min_by_key(|(_, conn)| conn.last_active)
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest_key {
+            self.connections.remove(&key);
         }
     }
 
@@ -419,11 +440,14 @@ impl TlsDecryptor {
         record: &TlsRawRecord,
         is_from_client: bool,
     ) -> Option<Vec<u8>> {
+        // Bail if record length exceeds u16 range (malformed record)
+        let record_len = u16::try_from(record.hdr.len).ok()?;
+
         // Build AAD (same for all attempts)
         let mut aad = Vec::with_capacity(5);
         aad.push(record.hdr.record_type.0);
         aad.extend_from_slice(&u16::from(record.hdr.version).to_be_bytes());
-        aad.extend_from_slice(&(record.hdr.len as u16).to_be_bytes());
+        aad.extend_from_slice(&record_len.to_be_bytes());
 
         let conn = self.connections.get_mut(key)?;
 
@@ -497,18 +521,23 @@ impl TlsDecryptor {
 
         let mut ciphertext = record.data.to_vec();
 
-        // TLS 1.2 with GCM: first 8 bytes are the explicit nonce
-        if ciphertext.len() < 8 {
+        // TLS 1.2 with GCM: first 8 bytes are explicit nonce, then ciphertext + 16-byte tag
+        // Need at least 8 (nonce) + 16 (GCM tag) = 24 bytes minimum
+        if ciphertext.len() < 24 {
             return None;
         }
         let explicit_nonce: Vec<u8> = ciphertext.drain(..8).collect();
 
+        // Bail if record length exceeds u16 range (malformed record)
+        let record_len = u16::try_from(record.hdr.len).ok()?;
+
         // AAD: seq_num(8) + type(1) + version(2) + plaintext_length(2)
-        let plaintext_len = ciphertext.len().saturating_sub(16); // minus GCM tag
+        let plaintext_len = ciphertext.len() - 16; // minus GCM tag (safe: checked >= 24 above)
         let mut aad = Vec::with_capacity(13);
         aad.extend_from_slice(&(keys.seq_num()).to_be_bytes());
         aad.push(record.hdr.record_type.0);
         aad.extend_from_slice(&u16::from(record.hdr.version).to_be_bytes());
+        let _ = record_len; // length already validated above
         aad.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
 
         keys.decrypt_tls12_record(&mut ciphertext, &aad, &explicit_nonce)
@@ -522,7 +551,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     #[test]
-    fn max_connections_rejects_new_connections() {
+    fn max_connections_evicts_oldest() {
         let keylog = KeyLog::default();
         let mut decryptor = TlsDecryptor::new(keylog);
         let src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
@@ -536,11 +565,13 @@ mod tests {
         }
         assert_eq!(decryptor.connections.len(), MAX_CONNECTIONS);
 
-        // One more should be rejected
+        // One more should evict the oldest (port 1) and admit the new one
+        let first_key = StreamKey::new(src_ip, 1, dst_ip, 443);
         let extra_key = StreamKey::new(src_ip, 60000, dst_ip, 443);
         decryptor.process_packet(&extra_key, &[0xFF], src_ip, 60000);
         assert_eq!(decryptor.connections.len(), MAX_CONNECTIONS);
-        assert!(!decryptor.connections.contains_key(&extra_key));
+        assert!(decryptor.connections.contains_key(&extra_key));
+        assert!(!decryptor.connections.contains_key(&first_key));
     }
 
     #[test]

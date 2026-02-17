@@ -83,8 +83,10 @@ impl PacketSource {
                     let ts = {
                         let tv = packet.header.ts;
                         let secs = (tv.tv_sec as i64).max(0) as u64;
-                        let nanos = (tv.tv_usec as i64).max(0) as u32 * 1000;
-                        std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos)
+                        // tv_usec is microseconds (max 999_999) from libpcap's timeval.
+                        // Clamp to valid range to guard against malformed pcap/pcapng files.
+                        let usec = (tv.tv_usec as i64).max(0).min(999_999) as u32;
+                        std::time::UNIX_EPOCH + std::time::Duration::new(secs, usec * 1000)
                     };
 
                     let pkt = PacketData {

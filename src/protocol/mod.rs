@@ -90,6 +90,10 @@ pub struct StreamKey {
 
 impl StreamKey {
     pub fn new(src: IpAddr, src_port: u16, dst: IpAddr, dst_port: u16) -> Self {
+        // Normalize IPv6-mapped-IPv4 (::ffff:x.x.x.x) to plain IPv4 so that
+        // dual-stack connections map to the same stream.
+        let src = normalize_ip(src);
+        let dst = normalize_ip(dst);
         if (src, src_port) <= (dst, dst_port) {
             StreamKey {
                 addr_a: src,
@@ -105,6 +109,17 @@ impl StreamKey {
                 port_b: src_port,
             }
         }
+    }
+}
+
+/// Convert IPv6-mapped-IPv4 addresses to their IPv4 equivalent.
+fn normalize_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => ip,
+        },
+        other => other,
     }
 }
 
@@ -167,9 +182,17 @@ pub fn parse_packet(data: &[u8], link_type: LinkType) -> Option<ParsedPacket> {
             None,
             udp.payload().to_vec(),
         ),
-        Some(TransportSlice::Icmpv4(_)) | Some(TransportSlice::Icmpv6(_)) => {
-            (None, None, Transport::Icmp, None, None, Vec::new())
-        }
+        Some(TransportSlice::Icmpv4(_)) | Some(TransportSlice::Icmpv6(_)) => (
+            None,
+            None,
+            Transport::Icmp,
+            None,
+            None,
+            sliced
+                .ip_payload()
+                .map(|p| p.payload.to_vec())
+                .unwrap_or_default(),
+        ),
         _ => (None, None, Transport::Other, None, None, Vec::new()),
     };
 

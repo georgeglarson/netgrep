@@ -148,26 +148,43 @@ fn main() -> Result<()> {
             "Warning: --http requires TCP reassembly; it will be ignored with --no-reassemble"
         );
     }
+    if cli.keylog.is_some() && cli.no_reassemble {
+        eprintln!(
+            "Warning: --keylog requires TCP reassembly for TLS decryption; \
+             it will not work with --no-reassemble"
+        );
+    }
+
+    // --http is a no-op without reassembly; disable it to avoid confusion
+    let http_mode = cli.http && !cli.no_reassemble;
 
     if cli.tui {
         if cli.output_file.is_some() {
             eprintln!("Warning: --output-file is not supported in TUI mode and will be ignored");
         }
-        run_tui_mode(&cli, source, tls_decryptor, pattern)
+        run_tui_mode(&cli, source, tls_decryptor, pattern, http_mode)
     } else {
         // Install Ctrl+C handler for graceful shutdown
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
-        ctrlc::set_handler(move || {
+        if let Err(e) = ctrlc::set_handler(move || {
             if stop_clone.load(Ordering::Relaxed) {
                 // Second Ctrl+C — force exit
                 std::process::exit(1);
             }
             stop_clone.store(true, Ordering::Relaxed);
-        })
-        .ok();
+        }) {
+            eprintln!("Warning: failed to install Ctrl+C handler: {}", e);
+        }
 
-        run_cli_mode(&cli, &mut source, &mut tls_decryptor, &pattern, &stop_flag)
+        run_cli_mode(
+            &cli,
+            &mut source,
+            &mut tls_decryptor,
+            &pattern,
+            &stop_flag,
+            http_mode,
+        )
     }
 }
 
@@ -203,14 +220,25 @@ fn resolve_tls_payload(
 
 /// Build a match-text string, using DNS display format when in DNS mode.
 fn build_match_text(payload: &[u8], parsed: &protocol::ParsedPacket, dns_mode: bool) -> String {
-    let payload_str = String::from_utf8_lossy(payload);
     if dns_mode && parsed.is_dns_port() {
-        protocol::dns::parse_dns(payload)
-            .map(|info| info.display_string())
-            .unwrap_or_else(|| payload_str.to_string())
-    } else {
-        payload_str.to_string()
+        let dns_data = dns_payload(payload, parsed.is_tcp());
+        if let Some(info) = protocol::dns::parse_dns(dns_data) {
+            return info.display_string();
+        }
     }
+    String::from_utf8_lossy(payload).into_owned()
+}
+
+/// Strip the 2-byte TCP DNS length prefix if this is a TCP packet.
+/// DNS over TCP prepends a u16 length before the DNS message.
+fn dns_payload(payload: &[u8], is_tcp: bool) -> &[u8] {
+    if is_tcp && payload.len() > 2 {
+        let dns_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+        if dns_len + 2 <= payload.len() {
+            return &payload[2..2 + dns_len];
+        }
+    }
+    payload
 }
 
 /// Check whether text matches the pattern, respecting invert flag.
@@ -227,8 +255,9 @@ fn run_cli_mode(
     tls_decryptor: &mut Option<tls::TlsDecryptor>,
     pattern: &Option<Regex>,
     stop_flag: &Arc<AtomicBool>,
+    http_mode: bool,
 ) -> Result<()> {
-    let formatter = Formatter::new(cli.json, cli.hex, cli.quiet, cli.http, cli.dns);
+    let formatter = Formatter::new(cli.json, cli.hex, cli.quiet, http_mode, cli.dns);
     let mut stream_table = StreamTable::new();
     let mut match_count: usize = 0;
     let link_type = source.link_type();
@@ -302,6 +331,7 @@ fn run_tui_mode(
     mut source: PacketSource,
     mut tls_decryptor: Option<tls::TlsDecryptor>,
     pattern: Option<Regex>,
+    http_mode: bool,
 ) -> Result<()> {
     let (tx, rx) = crossbeam_channel::unbounded::<tui::event::CaptureEvent>();
     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -313,15 +343,14 @@ fn run_tui_mode(
     let reassemble = !cli.no_reassemble;
     let invert = cli.invert;
     let dns_mode = cli.dns;
-    let http_mode = cli.http;
     let count_limit = cli.count;
 
-    let capture_thread = std::thread::spawn(move || {
+    let capture_thread = std::thread::spawn(move || -> Result<()> {
         let mut stream_table = StreamTable::new();
         let mut event_id: usize = 0;
         let mut match_count: usize = 0;
 
-        let _ = source.for_each_packet(|packet_data| {
+        source.for_each_packet(|packet_data| {
             if capture_stop.load(Ordering::Relaxed) {
                 return false;
             }
@@ -374,7 +403,7 @@ fn run_tui_mode(
                 Some(n) => match_count < n,
                 None => true,
             }
-        });
+        })
     });
 
     // Run TUI on main thread
@@ -382,9 +411,13 @@ fn run_tui_mode(
 
     // Ensure capture thread stops
     stop_flag.store(true, Ordering::Relaxed);
-    let _ = capture_thread.join();
-
-    result
+    match capture_thread.join() {
+        Ok(Err(e)) => {
+            // TUI exited cleanly but capture had an error — report it
+            result.and(Err(e))
+        }
+        _ => result,
+    }
 }
 
 fn list_interfaces() -> Result<()> {

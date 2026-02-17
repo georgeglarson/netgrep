@@ -28,7 +28,8 @@ impl Formatter {
 
     pub fn print_packet(&self, packet: &ParsedPacket, pattern: &Option<Regex>) {
         if self.dns && packet.is_dns_port() {
-            if let Some(info) = dns::parse_dns(&packet.payload) {
+            let dns_data = dns_payload(&packet.payload, packet.is_tcp());
+            if let Some(info) = dns::parse_dns(dns_data) {
                 if self.json {
                     self.print_dns_json(packet, &info);
                 } else {
@@ -265,6 +266,17 @@ impl Formatter {
         });
         println!("{}", j);
     }
+}
+
+/// Strip the 2-byte TCP DNS length prefix if this is a TCP packet.
+fn dns_payload<'a>(payload: &'a [u8], is_tcp: bool) -> &'a [u8] {
+    if is_tcp && payload.len() > 2 {
+        let dns_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+        if dns_len + 2 <= payload.len() {
+            return &payload[2..2 + dns_len];
+        }
+    }
+    payload
 }
 
 /// Print payload with regex matches highlighted in red.
