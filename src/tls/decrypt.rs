@@ -11,8 +11,13 @@ pub struct DirectionKeys {
 }
 
 impl DirectionKeys {
-    pub fn new(key_bytes: &[u8], iv_bytes: &[u8; 12], algo: &'static aead::Algorithm) -> Result<Self> {
-        let unbound = UnboundKey::new(algo, key_bytes).map_err(|_| anyhow::anyhow!("Invalid key"))?;
+    pub fn new(
+        key_bytes: &[u8],
+        iv_bytes: &[u8; 12],
+        algo: &'static aead::Algorithm,
+    ) -> Result<Self> {
+        let unbound =
+            UnboundKey::new(algo, key_bytes).map_err(|_| anyhow::anyhow!("Invalid key"))?;
         Ok(DirectionKeys {
             key: LessSafeKey::new(unbound),
             iv: *iv_bytes,
@@ -23,7 +28,11 @@ impl DirectionKeys {
     /// Decrypt a TLS record in place. Returns the plaintext slice.
     /// For TLS 1.3, the additional_data is the record header (5 bytes).
     /// For TLS 1.2, the additional_data is: seq(8) + type(1) + version(2) + length(2).
-    pub fn decrypt_record(&mut self, ciphertext: &mut Vec<u8>, additional_data: &[u8]) -> Result<Vec<u8>> {
+    pub fn decrypt_record(
+        &mut self,
+        ciphertext: &mut Vec<u8>,
+        additional_data: &[u8],
+    ) -> Result<Vec<u8>> {
         let nonce = self.build_nonce();
 
         let nonce = aead::Nonce::try_assume_unique_for_key(&nonce)
@@ -59,8 +68,8 @@ impl DirectionKeys {
         let copy_len = explicit_nonce.len().min(8);
         nonce[4..4 + copy_len].copy_from_slice(&explicit_nonce[..copy_len]);
 
-        let nonce =
-            aead::Nonce::try_assume_unique_for_key(&nonce).map_err(|_| anyhow::anyhow!("Invalid nonce"))?;
+        let nonce = aead::Nonce::try_assume_unique_for_key(&nonce)
+            .map_err(|_| anyhow::anyhow!("Invalid nonce"))?;
         let aad = aead::Aad::from(additional_data);
 
         let plaintext = self
@@ -203,5 +212,86 @@ struct HkdfLen(usize);
 impl hkdf::KeyType for HkdfLen {
     fn len(&self) -> usize {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_keys(iv: [u8; 12]) -> DirectionKeys {
+        let key_bytes = [0u8; 16];
+        DirectionKeys::new(&key_bytes, &iv, &aead::AES_128_GCM).unwrap()
+    }
+
+    #[test]
+    fn build_nonce_seq_zero_equals_iv() {
+        let iv = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let keys = make_keys(iv);
+        assert_eq!(keys.build_nonce(), iv);
+    }
+
+    #[test]
+    fn build_nonce_seq_one_xors_last_byte() {
+        let iv = [0u8; 12];
+        let mut keys = make_keys(iv);
+        keys.seq = 1;
+        let nonce = keys.build_nonce();
+        let mut expected = [0u8; 12];
+        expected[11] = 1;
+        assert_eq!(nonce, expected);
+    }
+
+    #[test]
+    fn build_nonce_seq_all_bits_xors_last_eight_bytes() {
+        let iv = [0xFF; 12];
+        let mut keys = make_keys(iv);
+        keys.seq = u64::MAX;
+        let nonce = keys.build_nonce();
+        // First 4 bytes of IV untouched, last 8 bytes XOR'd with 0xFF
+        let mut expected = [0xFF; 12];
+        for i in 4..12 {
+            expected[i] = 0x00;
+        }
+        assert_eq!(nonce, expected);
+    }
+
+    #[test]
+    fn build_nonce_only_xors_last_eight_bytes() {
+        let iv = [
+            0xAA, 0xBB, 0xCC, 0xDD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut keys = make_keys(iv);
+        keys.seq = 0x0102030405060708;
+        let nonce = keys.build_nonce();
+        // First 4 bytes unchanged
+        assert_eq!(nonce[0], 0xAA);
+        assert_eq!(nonce[1], 0xBB);
+        assert_eq!(nonce[2], 0xCC);
+        assert_eq!(nonce[3], 0xDD);
+        // Last 8 bytes: 0x00 XOR seq big-endian bytes
+        assert_eq!(nonce[4], 0x01);
+        assert_eq!(nonce[5], 0x02);
+        assert_eq!(nonce[6], 0x03);
+        assert_eq!(nonce[7], 0x04);
+        assert_eq!(nonce[8], 0x05);
+        assert_eq!(nonce[9], 0x06);
+        assert_eq!(nonce[10], 0x07);
+        assert_eq!(nonce[11], 0x08);
+    }
+
+    #[test]
+    fn build_nonce_seq_increments_on_decrypt_not_build() {
+        let keys = make_keys([0u8; 12]);
+        // Calling build_nonce multiple times doesn't change seq
+        let n1 = keys.build_nonce();
+        let n2 = keys.build_nonce();
+        assert_eq!(n1, n2);
+    }
+
+    #[test]
+    fn seq_num_starts_at_zero() {
+        let keys = make_keys([0u8; 12]);
+        assert_eq!(keys.seq_num(), 0);
     }
 }

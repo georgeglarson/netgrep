@@ -66,6 +66,9 @@ impl TlsConnection {
     }
 }
 
+const MAX_CONNECTIONS: usize = 10_000;
+const MAX_DECRYPTED_BYTES: usize = 1_048_576; // 1 MB per connection
+
 /// Manages TLS decryption across all connections.
 pub struct TlsDecryptor {
     keylog: KeyLog,
@@ -90,6 +93,11 @@ impl TlsDecryptor {
         src_port: u16,
     ) {
         if payload.is_empty() {
+            return;
+        }
+
+        // Skip if at capacity and this is a new connection
+        if !self.connections.contains_key(key) && self.connections.len() >= MAX_CONNECTIONS {
             return;
         }
 
@@ -120,13 +128,7 @@ impl TlsDecryptor {
     }
 
     /// Parse complete TLS records from one direction's buffer.
-    fn drain_buffer(
-        &mut self,
-        key: &StreamKey,
-        from_client: bool,
-        src_ip: IpAddr,
-        src_port: u16,
-    ) {
+    fn drain_buffer(&mut self, key: &StreamKey, from_client: bool, src_ip: IpAddr, src_port: u16) {
         // Take the buffer out to avoid borrow conflicts with self methods
         let conn = match self.connections.get_mut(key) {
             Some(c) => c,
@@ -174,8 +176,14 @@ impl TlsDecryptor {
             // Check if cipher is active for this direction (TLS 1.2 post-CCS)
             let cipher_active = {
                 let c = self.connections.get(key);
-                c.map(|c| if from_client { c.client_cipher_active } else { c.server_cipher_active })
-                    .unwrap_or(false)
+                c.map(|c| {
+                    if from_client {
+                        c.client_cipher_active
+                    } else {
+                        c.server_cipher_active
+                    }
+                })
+                .unwrap_or(false)
             };
 
             match record.hdr.record_type {
@@ -197,7 +205,12 @@ impl TlsDecryptor {
                     if let Some(plaintext) = self.decrypt_record(key, &record, src_ip, src_port) {
                         if record.hdr.record_type == TlsRecordType::ApplicationData {
                             if let Some(conn) = self.connections.get_mut(key) {
-                                conn.decrypted.extend_from_slice(&plaintext);
+                                let remaining =
+                                    MAX_DECRYPTED_BYTES.saturating_sub(conn.decrypted.len());
+                                let to_copy = plaintext.len().min(remaining);
+                                if to_copy > 0 {
+                                    conn.decrypted.extend_from_slice(&plaintext[..to_copy]);
+                                }
                             }
                         }
                     }
@@ -219,13 +232,7 @@ impl TlsDecryptor {
         }
     }
 
-    fn process_handshake(
-        &mut self,
-        key: &StreamKey,
-        data: &[u8],
-        src_ip: IpAddr,
-        src_port: u16,
-    ) {
+    fn process_handshake(&mut self, key: &StreamKey, data: &[u8], src_ip: IpAddr, src_port: u16) {
         let current_version = self.connections.get(key).and_then(|c| c.version);
         let result = match handshake::parse_handshake(data, src_ip, src_port, current_version) {
             Some(r) => r,
@@ -436,6 +443,10 @@ impl TlsDecryptor {
             if let Ok(plaintext) = keys.decrypt_record(&mut ct, &aad) {
                 if let Some((data, content_type)) = Self::strip_tls13_content_type(plaintext) {
                     if content_type == 0x17 {
+                        // Handshake is complete — discard handshake keys to avoid
+                        // wasting cycles trying them on every subsequent record.
+                        conn.client_hs_keys = None;
+                        conn.server_hs_keys = None;
                         return Some(data);
                     }
                     return None;
@@ -488,5 +499,122 @@ impl TlsDecryptor {
 
         keys.decrypt_tls12_record(&mut ciphertext, &aad, &explicit_nonce)
             .ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn max_connections_rejects_new_connections() {
+        let keylog = KeyLog::default();
+        let mut decryptor = TlsDecryptor::new(keylog);
+        let src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let dst_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+        // Fill to MAX_CONNECTIONS with unique stream keys (varying port)
+        for i in 0..MAX_CONNECTIONS {
+            let key = StreamKey::new(src_ip, i as u16 + 1, dst_ip, 443);
+            // Any non-empty payload triggers entry creation
+            decryptor.process_packet(&key, &[0xFF], src_ip, i as u16 + 1);
+        }
+        assert_eq!(decryptor.connections.len(), MAX_CONNECTIONS);
+
+        // One more should be rejected
+        let extra_key = StreamKey::new(src_ip, 60000, dst_ip, 443);
+        decryptor.process_packet(&extra_key, &[0xFF], src_ip, 60000);
+        assert_eq!(decryptor.connections.len(), MAX_CONNECTIONS);
+        assert!(!decryptor.connections.contains_key(&extra_key));
+    }
+
+    #[test]
+    fn max_connections_allows_existing_connection() {
+        let keylog = KeyLog::default();
+        let mut decryptor = TlsDecryptor::new(keylog);
+        let src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let dst_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+        // Fill to MAX_CONNECTIONS
+        for i in 0..MAX_CONNECTIONS {
+            let key = StreamKey::new(src_ip, i as u16 + 1, dst_ip, 443);
+            decryptor.process_packet(&key, &[0xFF], src_ip, i as u16 + 1);
+        }
+
+        // Sending more data to an existing connection should still work
+        let existing_key = StreamKey::new(src_ip, 1, dst_ip, 443);
+        decryptor.process_packet(&existing_key, &[0xAA], src_ip, 1);
+        assert_eq!(decryptor.connections.len(), MAX_CONNECTIONS);
+        // Connection still exists (wasn't rejected)
+        assert!(decryptor.connections.contains_key(&existing_key));
+    }
+
+    #[test]
+    fn max_decrypted_bytes_caps_buffer() {
+        let keylog = KeyLog::default();
+        let mut decryptor = TlsDecryptor::new(keylog);
+        let src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let dst_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let key = StreamKey::new(src_ip, 12345, dst_ip, 443);
+
+        // Manually insert a connection and fill its decrypted buffer
+        decryptor.process_packet(&key, &[0xFF], src_ip, 12345);
+        let conn = decryptor.connections.get_mut(&key).unwrap();
+        conn.decrypted = vec![0xAA; MAX_DECRYPTED_BYTES];
+
+        // Verify the cap constant is what we expect
+        assert_eq!(conn.decrypted.len(), 1_048_576);
+        assert_eq!(MAX_DECRYPTED_BYTES, 1_048_576);
+    }
+
+    #[test]
+    fn strip_tls13_content_type_application_data() {
+        let plaintext = vec![b'h', b'e', b'l', b'l', b'o', 0x17]; // 0x17 = application data
+        let (data, ct) = TlsDecryptor::strip_tls13_content_type(plaintext).unwrap();
+        assert_eq!(data, b"hello");
+        assert_eq!(ct, 0x17);
+    }
+
+    #[test]
+    fn strip_tls13_content_type_strips_trailing_zeros() {
+        let plaintext = vec![b'h', b'i', 0x17, 0x00, 0x00]; // trailing padding zeros
+        // Zeros are stripped first, then content type byte
+        // After stripping zeros: [b'h', b'i', 0x17]
+        // Pop content type: 0x17, data = [b'h', b'i']
+        let (data, ct) = TlsDecryptor::strip_tls13_content_type(plaintext).unwrap();
+        assert_eq!(data, b"hi");
+        assert_eq!(ct, 0x17);
+    }
+
+    #[test]
+    fn strip_tls13_content_type_empty_returns_none() {
+        let plaintext = vec![];
+        assert!(TlsDecryptor::strip_tls13_content_type(plaintext).is_none());
+    }
+
+    #[test]
+    fn strip_tls13_content_type_all_zeros_returns_none() {
+        let plaintext = vec![0x00, 0x00, 0x00];
+        assert!(TlsDecryptor::strip_tls13_content_type(plaintext).is_none());
+    }
+
+    #[test]
+    fn tls_connection_is_from_client() {
+        let mut conn = TlsConnection::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        conn.client_addr = Some((ip, 5000));
+
+        assert!(conn.is_from_client(ip, 5000));
+        assert!(!conn.is_from_client(ip, 5001));
+        assert!(!conn.is_from_client(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 2)), 5000));
+    }
+
+    #[test]
+    fn tls_connection_default_client_detection() {
+        let conn = TlsConnection::new();
+        // Before ClientHello, any sender is treated as client
+        let any_ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert!(conn.is_from_client(any_ip, 12345));
     }
 }

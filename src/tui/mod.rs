@@ -1,17 +1,17 @@
 pub mod event;
 
 use std::io::stdout;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Result;
 use crossbeam_channel::Receiver;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
-use ratatui::Terminal;
 
 use event::CaptureEvent;
 
@@ -43,9 +43,7 @@ impl AppState {
     }
 
     fn selected_event(&self) -> Option<&CaptureEvent> {
-        self.table_state
-            .selected()
-            .and_then(|i| self.events.get(i))
+        self.table_state.selected().and_then(|i| self.events.get(i))
     }
 
     fn select_next(&mut self) {
@@ -163,9 +161,13 @@ fn render(frame: &mut ratatui::Frame, app: &mut AppState) {
     .split(area);
 
     // --- Packet Table ---
-    let header_cells = ["#", "Proto", "Source", "Dest", "Summary"]
-        .iter()
-        .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    let header_cells = ["#", "Proto", "Source", "Dest", "Summary"].iter().map(|h| {
+        Cell::from(*h).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    });
     let header = Row::new(header_cells).height(1);
 
     let rows: Vec<Row> = app
@@ -258,11 +260,13 @@ fn render(frame: &mut ratatui::Frame, app: &mut AppState) {
     let status = Line::from(vec![
         Span::styled(
             format!(" {} ", status_indicator),
-            Style::default().fg(Color::Black).bg(if app.capture_running {
-                Color::Green
-            } else {
-                Color::Yellow
-            }),
+            Style::default()
+                .fg(Color::Black)
+                .bg(if app.capture_running {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
         ),
         Span::raw(format!(
             " Matched: {} | Seen: {} | q:quit  j/k:nav  Tab:focus  Home/End:jump ",

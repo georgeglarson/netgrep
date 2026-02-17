@@ -21,8 +21,8 @@ pub struct Tls13Secrets {
 
 impl KeyLog {
     pub fn from_file(path: &Path) -> Result<Self> {
-        let contents =
-            std::fs::read_to_string(path).context(format!("Failed to read keylog: {}", path.display()))?;
+        let contents = std::fs::read_to_string(path)
+            .context(format!("Failed to read keylog: {}", path.display()))?;
         Self::parse(&contents)
     }
 
@@ -87,11 +87,6 @@ impl KeyLog {
         }
 
         Ok(keylog)
-    }
-
-    pub fn has_secrets_for(&self, client_random: &[u8; 32]) -> bool {
-        self.master_secrets.contains_key(client_random)
-            || self.tls13_secrets.contains_key(client_random)
     }
 }
 

@@ -10,16 +10,20 @@ use clap::Parser;
 use pcap::Device;
 use regex::Regex;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use capture::pcap_writer::PcapWriter;
 use capture::PacketSource;
+use capture::pcap_writer::PcapWriter;
 use output::Formatter;
 use reassembly::StreamTable;
 
 #[derive(Parser)]
-#[command(name = "netgrep", version, about = "Grep for the network, for a post-TLS world")]
+#[command(
+    name = "netgrep",
+    version,
+    about = "Grep for the network, for a post-TLS world"
+)]
 struct Cli {
     /// Regex pattern to match against packet payloads / reassembled streams
     pattern: Option<String>,
@@ -56,9 +60,9 @@ struct Cli {
     #[arg(short = 'p', long)]
     no_promisc: bool,
 
-    /// Reassemble TCP streams before matching (default: true)
-    #[arg(long, default_value_t = true)]
-    reassemble: bool,
+    /// Disable TCP stream reassembly (match individual packets instead)
+    #[arg(long)]
+    no_reassemble: bool,
 
     /// Show hex dump of matched payloads
     #[arg(short = 'x', long)]
@@ -120,8 +124,12 @@ fn main() -> Result<()> {
     let mut source = if let Some(ref path) = cli.input {
         PacketSource::from_file(path, cli.bpf.as_deref())?
     } else {
-        let interface = cli.interface.as_deref().unwrap_or("any");
-        PacketSource::live(interface, cli.snaplen, !cli.no_promisc, cli.bpf.as_deref())?
+        PacketSource::live(
+            cli.interface.as_deref(),
+            cli.snaplen,
+            !cli.no_promisc,
+            cli.bpf.as_deref(),
+        )?
     };
 
     let mut tls_decryptor = match &cli.keylog {
@@ -133,9 +141,24 @@ fn main() -> Result<()> {
     };
 
     if cli.tui {
+        if cli.output_file.is_some() {
+            eprintln!("Warning: --output-file is not supported in TUI mode and will be ignored");
+        }
         run_tui_mode(&cli, source, tls_decryptor, pattern)
     } else {
-        run_cli_mode(&cli, &mut source, &mut tls_decryptor, &pattern)
+        // Install Ctrl+C handler for graceful shutdown
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop_flag.clone();
+        ctrlc::set_handler(move || {
+            if stop_clone.load(Ordering::Relaxed) {
+                // Second Ctrl+C — force exit
+                std::process::exit(1);
+            }
+            stop_clone.store(true, Ordering::Relaxed);
+        })
+        .ok();
+
+        run_cli_mode(&cli, &mut source, &mut tls_decryptor, &pattern, &stop_flag)
     }
 }
 
@@ -144,10 +167,12 @@ fn run_cli_mode(
     source: &mut PacketSource,
     tls_decryptor: &mut Option<tls::TlsDecryptor>,
     pattern: &Option<Regex>,
+    stop_flag: &Arc<AtomicBool>,
 ) -> Result<()> {
     let formatter = Formatter::new(cli.json, cli.hex, cli.quiet, cli.http, cli.dns);
     let mut stream_table = StreamTable::new();
     let mut match_count: usize = 0;
+    let link_type = source.link_type();
 
     let mut pcap_writer = match &cli.output_file {
         Some(path) => {
@@ -159,7 +184,11 @@ fn run_cli_mode(
     };
 
     source.for_each_packet(|packet_data| {
-        let parsed = match protocol::parse_packet(packet_data.data) {
+        if stop_flag.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let parsed = match protocol::parse_packet(packet_data.data, link_type) {
             Some(p) => p,
             None => return true,
         };
@@ -175,7 +204,7 @@ fn run_cli_mode(
             }
         }
 
-        if cli.reassemble && parsed.is_tcp() {
+        if !cli.no_reassemble && parsed.is_tcp() {
             if let Some(stream_data) = stream_table.process(&parsed) {
                 // Use decrypted plaintext if available, otherwise raw stream data
                 let effective_payload = if let Some(decryptor) = tls_decryptor.as_ref() {
@@ -207,7 +236,7 @@ fn run_cli_mode(
         } else {
             let match_text = if cli.dns
                 && parsed.transport == protocol::Transport::Udp
-                && (parsed.src_port == Some(53) || parsed.dst_port == Some(53))
+                && parsed.is_dns_port()
             {
                 protocol::dns::parse_dns(&parsed.payload)
                     .map(|info| info.display_string())
@@ -247,9 +276,10 @@ fn run_tui_mode(
     let stop_flag = Arc::new(AtomicBool::new(false));
     let packets_seen = Arc::new(AtomicU64::new(0));
 
+    let link_type = source.link_type();
     let capture_stop = stop_flag.clone();
     let capture_seen = packets_seen.clone();
-    let reassemble = cli.reassemble;
+    let reassemble = !cli.no_reassemble;
     let invert = cli.invert;
     let dns_mode = cli.dns;
     let http_mode = cli.http;
@@ -267,7 +297,7 @@ fn run_tui_mode(
 
             capture_seen.fetch_add(1, Ordering::Relaxed);
 
-            let parsed = match protocol::parse_packet(packet_data.data) {
+            let parsed = match protocol::parse_packet(packet_data.data, link_type) {
                 Some(p) => p,
                 None => return true,
             };
@@ -305,8 +335,11 @@ fn run_tui_mode(
                             key: stream_data.key,
                             payload: effective_payload,
                         };
-                        let event =
-                            tui::event::CaptureEvent::from_stream(event_id, &display_data, http_mode);
+                        let event = tui::event::CaptureEvent::from_stream(
+                            event_id,
+                            &display_data,
+                            http_mode,
+                        );
                         if tx.send(event).is_err() {
                             return false;
                         }
@@ -316,7 +349,7 @@ fn run_tui_mode(
             } else {
                 let match_text = if dns_mode
                     && parsed.transport == protocol::Transport::Udp
-                    && (parsed.src_port == Some(53) || parsed.dst_port == Some(53))
+                    && parsed.is_dns_port()
                 {
                     protocol::dns::parse_dns(&parsed.payload)
                         .map(|info| info.display_string())
@@ -330,8 +363,7 @@ fn run_tui_mode(
                 };
                 if matched {
                     event_id += 1;
-                    let event =
-                        tui::event::CaptureEvent::from_packet(event_id, &parsed, dns_mode);
+                    let event = tui::event::CaptureEvent::from_packet(event_id, &parsed, dns_mode);
                     if tx.send(event).is_err() {
                         return false;
                     }
@@ -360,17 +392,8 @@ fn list_interfaces() -> Result<()> {
     let devices = Device::list()?;
     for dev in devices {
         let desc = dev.desc.as_deref().unwrap_or("");
-        let addrs: Vec<String> = dev
-            .addresses
-            .iter()
-            .map(|a| a.addr.to_string())
-            .collect();
-        println!(
-            "{:<16} {}  [{}]",
-            dev.name,
-            desc,
-            addrs.join(", ")
-        );
+        let addrs: Vec<String> = dev.addresses.iter().map(|a| a.addr.to_string()).collect();
+        println!("{:<16} {}  [{}]", dev.name, desc, addrs.join(", "));
     }
     Ok(())
 }

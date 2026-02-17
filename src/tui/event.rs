@@ -14,26 +14,13 @@ pub struct RowSummary {
     pub src: String,
     pub dst: String,
     pub info: String,
-    pub payload_len: usize,
 }
 
 pub enum DetailContent {
-    Packet {
-        header: String,
-        payload: Vec<u8>,
-    },
-    Stream {
-        header: String,
-        payload: Vec<u8>,
-    },
-    Http {
-        header: String,
-        display: String,
-    },
-    Dns {
-        header: String,
-        display: String,
-    },
+    Packet { header: String, payload: Vec<u8> },
+    Stream { header: String, payload: Vec<u8> },
+    Http { header: String, display: String },
+    Dns { header: String, display: String },
 }
 
 impl DetailContent {
@@ -70,10 +57,7 @@ impl CaptureEvent {
         let dst = format_addr(parsed.dst_ip, parsed.dst_port);
 
         // Check for DNS
-        if dns_mode
-            && parsed.transport == Transport::Udp
-            && (parsed.src_port == Some(53) || parsed.dst_port == Some(53))
-        {
+        if dns_mode && parsed.transport == Transport::Udp && parsed.is_dns_port() {
             if let Some(info) = dns::parse_dns(&parsed.payload) {
                 return Self::from_dns(id, &src, &dst, &info);
             }
@@ -90,7 +74,10 @@ impl CaptureEvent {
 
         let header = format!(
             "{} {} -> {} ({} bytes)",
-            proto, src, dst, parsed.payload.len()
+            proto,
+            src,
+            dst,
+            parsed.payload.len()
         );
 
         CaptureEvent {
@@ -100,7 +87,6 @@ impl CaptureEvent {
                 src,
                 dst,
                 info,
-                payload_len: parsed.payload.len(),
             },
             detail: DetailContent::Packet {
                 header,
@@ -110,19 +96,19 @@ impl CaptureEvent {
     }
 
     pub fn from_stream(id: usize, stream: &StreamData, http_mode: bool) -> Self {
-        let src = format!(
-            "{}:{}",
-            stream.key.addr_a, stream.key.port_a
-        );
-        let dst = format!(
-            "{}:{}",
-            stream.key.addr_b, stream.key.port_b
-        );
+        let src = format!("{}:{}", stream.key.addr_a, stream.key.port_a);
+        let dst = format!("{}:{}", stream.key.addr_b, stream.key.port_b);
 
         if http_mode {
             let messages = http::parse_http(&stream.payload);
-            if let Some(msg) = messages.first() {
-                return Self::from_http(id, &src, &dst, &stream.key.to_string(), msg);
+            if !messages.is_empty() {
+                return Self::from_http_messages(
+                    id,
+                    &src,
+                    &dst,
+                    &stream.key.to_string(),
+                    &messages,
+                );
             }
         }
 
@@ -135,10 +121,7 @@ impl CaptureEvent {
             .take(80)
             .collect();
 
-        let header = format!(
-            "STREAM {} ({} bytes)",
-            stream.key, stream.payload.len()
-        );
+        let header = format!("STREAM {} ({} bytes)", stream.key, stream.payload.len());
 
         CaptureEvent {
             id,
@@ -147,7 +130,6 @@ impl CaptureEvent {
                 src,
                 dst,
                 info,
-                payload_len: stream.payload.len(),
             },
             detail: DetailContent::Stream {
                 header,
@@ -170,10 +152,7 @@ impl CaptureEvent {
 
         let (proto, short_info) = if info.is_response {
             let rcode = dns::rcode_str(info.rcode);
-            (
-                "DNS R".into(),
-                format!("{} {} {}", qname, qtype, rcode),
-            )
+            ("DNS R".into(), format!("{} {} {}", qname, qtype, rcode))
         } else {
             ("DNS Q".into(), format!("{} {}", qname, qtype))
         };
@@ -183,7 +162,10 @@ impl CaptureEvent {
             display.push_str(&format!("Q: {} {}\n", q.name, q.qtype));
         }
         for r in &info.answers {
-            display.push_str(&format!("A: {} {} {} TTL={}\n", r.name, r.rtype, r.rdata, r.ttl));
+            display.push_str(&format!(
+                "A: {} {} {} TTL={}\n",
+                r.name, r.rtype, r.rdata, r.ttl
+            ));
         }
         for r in &info.authorities {
             display.push_str(&format!(
@@ -205,39 +187,51 @@ impl CaptureEvent {
                 src: src.to_string(),
                 dst: dst.to_string(),
                 info: short_info,
-                payload_len: 0,
             },
             detail: DetailContent::Dns { header, display },
         }
     }
 
-    fn from_http(
+    fn from_http_messages(
         id: usize,
         src: &str,
         dst: &str,
         stream_id: &str,
-        msg: &HttpMessage,
+        messages: &[HttpMessage],
     ) -> Self {
-        let (proto, info) = match &msg.kind {
+        // Summary shows the first message's info
+        let first = &messages[0];
+        let info = match &first.kind {
             crate::protocol::http::HttpKind::Request { method, uri, .. } => {
-                ("HTTP".into(), format!("{} {}", method, uri))
+                format!("{} {}", method, uri)
             }
             crate::protocol::http::HttpKind::Response { status, reason, .. } => {
-                ("HTTP".into(), format!("{} {}", status, reason))
+                format!("{} {}", status, reason)
             }
         };
 
-        let header = format!("HTTP {} {}", stream_id, &info);
-        let display = msg.display_string();
+        let count_suffix = if messages.len() > 1 {
+            format!(" (+{} more)", messages.len() - 1)
+        } else {
+            String::new()
+        };
+
+        let header = format!("HTTP {} {}{}", stream_id, &info, count_suffix);
+
+        // Combine all messages into the display
+        let display: String = messages
+            .iter()
+            .map(|msg| msg.display_string())
+            .collect::<Vec<_>>()
+            .join("\n---\n");
 
         CaptureEvent {
             id,
             summary: RowSummary {
-                proto,
+                proto: "HTTP".into(),
                 src: src.to_string(),
                 dst: dst.to_string(),
                 info,
-                payload_len: 0,
             },
             detail: DetailContent::Http { header, display },
         }

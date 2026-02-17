@@ -45,3 +45,6 @@ simple-dns = "0.11"
 
 # Crypto (HKDF, AES-GCM, HMAC for TLS key derivation + decryption)
 ring = "0.17"
+
+# Signal handling
+ctrlc = "3"

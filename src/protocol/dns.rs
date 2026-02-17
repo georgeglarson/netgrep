@@ -1,5 +1,5 @@
 use serde::Serialize;
-use simple_dns::{rdata::RData, Packet, PacketFlag, OPCODE, QTYPE, RCODE};
+use simple_dns::{OPCODE, Packet, PacketFlag, QTYPE, RCODE, rdata::RData};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 #[derive(Debug, Serialize)]
@@ -105,14 +105,22 @@ fn rdata_to_string(rdata: &RData) -> String {
         RData::NS(ns) => ns.0.to_string(),
         RData::PTR(ptr) => ptr.0.to_string(),
         RData::SOA(soa) => format!("{} {} {}", soa.mname, soa.rname, soa.serial),
-        RData::SRV(srv) => format!("{}:{} p={} w={}", srv.target, srv.port, srv.priority, srv.weight),
-        RData::TXT(txt) => txt.attributes().into_iter().map(|(k, v)| {
-            if let Some(val) = v {
-                format!("{}={}", k, val)
-            } else {
-                k
-            }
-        }).collect::<Vec<_>>().join(" "),
+        RData::SRV(srv) => format!(
+            "{}:{} p={} w={}",
+            srv.target, srv.port, srv.priority, srv.weight
+        ),
+        RData::TXT(txt) => txt
+            .attributes()
+            .into_iter()
+            .map(|(k, v)| {
+                if let Some(val) = v {
+                    format!("{}={}", k, val)
+                } else {
+                    k
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
         RData::CAA(caa) => format!("{:?}", caa),
         RData::OPT(_) => String::new(),
         _ => format!("{:?}", rdata),
@@ -177,7 +185,12 @@ impl DnsInfo {
             out.push(' ');
         }
 
-        for r in self.answers.iter().chain(&self.authorities).chain(&self.additionals) {
+        for r in self
+            .answers
+            .iter()
+            .chain(&self.authorities)
+            .chain(&self.additionals)
+        {
             out.push_str(&r.name);
             out.push(' ');
             out.push_str(&r.rtype);
@@ -195,7 +208,7 @@ impl DnsInfo {
 mod tests {
     use super::*;
     use simple_dns::rdata::{self, RData};
-    use simple_dns::{Name, Question, ResourceRecord, CLASS, QCLASS, QTYPE, TYPE};
+    use simple_dns::{CLASS, Name, QCLASS, QTYPE, Question, ResourceRecord, TYPE};
 
     /// Helper: build a DNS query packet and serialize to wire bytes.
     fn build_query(id: u16, name: &str, qtype: TYPE) -> Vec<u8> {
@@ -332,9 +345,7 @@ mod tests {
             5,
             "34.216.184.93.in-addr.arpa",
             TYPE::PTR,
-            vec![RData::PTR(rdata::PTR(
-                Name::new("example.com").unwrap(),
-            ))],
+            vec![RData::PTR(rdata::PTR(Name::new("example.com").unwrap()))],
         );
         let info = parse_dns(&wire).unwrap();
 
@@ -358,18 +369,27 @@ mod tests {
         let info = parse_dns(&wire).unwrap();
 
         assert_eq!(info.answers[0].rtype, "SRV");
-        assert_eq!(info.answers[0].rdata, "sipserver.example.com:5060 p=10 w=60");
+        assert_eq!(
+            info.answers[0].rdata,
+            "sipserver.example.com:5060 p=10 w=60"
+        );
     }
 
     #[test]
     fn parse_txt_response() {
-        let txt = rdata::TXT::new().with_string("v=spf1 include:example.com ~all").unwrap();
+        let txt = rdata::TXT::new()
+            .with_string("v=spf1 include:example.com ~all")
+            .unwrap();
         let wire = build_response(7, "example.com", TYPE::TXT, vec![RData::TXT(txt)]);
         let info = parse_dns(&wire).unwrap();
 
         assert_eq!(info.answers[0].rtype, "TXT");
         // TXT attributes() parses key=value pairs
-        assert!(info.answers[0].rdata.contains("v=spf1 include:example.com ~all"));
+        assert!(
+            info.answers[0]
+                .rdata
+                .contains("v=spf1 include:example.com ~all")
+        );
     }
 
     #[test]
@@ -379,9 +399,15 @@ mod tests {
             "example.com",
             TYPE::A,
             vec![
-                RData::A(rdata::A { address: u32::from(Ipv4Addr::new(1, 2, 3, 4)) }),
-                RData::A(rdata::A { address: u32::from(Ipv4Addr::new(5, 6, 7, 8)) }),
-                RData::A(rdata::A { address: u32::from(Ipv4Addr::new(9, 10, 11, 12)) }),
+                RData::A(rdata::A {
+                    address: u32::from(Ipv4Addr::new(1, 2, 3, 4)),
+                }),
+                RData::A(rdata::A {
+                    address: u32::from(Ipv4Addr::new(5, 6, 7, 8)),
+                }),
+                RData::A(rdata::A {
+                    address: u32::from(Ipv4Addr::new(9, 10, 11, 12)),
+                }),
             ],
         );
         let info = parse_dns(&wire).unwrap();
@@ -523,7 +549,11 @@ mod tests {
         ] {
             let wire = build_query(100, "test.com", qtype);
             let info = parse_dns(&wire).unwrap();
-            assert_eq!(info.questions[0].qtype, expected, "qtype mismatch for {:?}", qtype);
+            assert_eq!(
+                info.questions[0].qtype, expected,
+                "qtype mismatch for {:?}",
+                qtype
+            );
         }
     }
 
@@ -546,7 +576,10 @@ mod tests {
         let info = parse_dns(&wire).unwrap();
 
         assert_eq!(info.answers[0].rtype, "SOA");
-        assert_eq!(info.answers[0].rdata, "ns1.example.com admin.example.com 2024010101");
+        assert_eq!(
+            info.answers[0].rdata,
+            "ns1.example.com admin.example.com 2024010101"
+        );
     }
 
     #[test]
@@ -607,7 +640,9 @@ mod tests {
             Name::new("example.com").unwrap(),
             CLASS::IN,
             3600,
-            RData::A(rdata::A { address: u32::from(Ipv4Addr::new(93, 184, 216, 34)) }),
+            RData::A(rdata::A {
+                address: u32::from(Ipv4Addr::new(93, 184, 216, 34)),
+            }),
         ));
         let wire = pkt.build_bytes_vec().unwrap();
         let info = parse_dns(&wire).unwrap();
@@ -641,7 +676,9 @@ mod tests {
             Name::new("ns1.example.com").unwrap(),
             CLASS::IN,
             86400,
-            RData::A(rdata::A { address: u32::from(Ipv4Addr::new(198, 51, 100, 1)) }),
+            RData::A(rdata::A {
+                address: u32::from(Ipv4Addr::new(198, 51, 100, 1)),
+            }),
         ));
         let wire = pkt.build_bytes_vec().unwrap();
         let info = parse_dns(&wire).unwrap();
@@ -720,7 +757,9 @@ mod tests {
             Name::new("dual.example.com").unwrap(),
             CLASS::IN,
             300,
-            RData::A(rdata::A { address: u32::from(Ipv4Addr::new(10, 0, 0, 1)) }),
+            RData::A(rdata::A {
+                address: u32::from(Ipv4Addr::new(10, 0, 0, 1)),
+            }),
         ));
         pkt.answers.push(ResourceRecord::new(
             Name::new("dual.example.com").unwrap(),

@@ -4,27 +4,37 @@ use anyhow::{Context, Result};
 use pcap::{Capture, Device};
 use std::path::Path;
 
+use crate::protocol::LinkType;
+
 pub struct PacketData<'a> {
     pub data: &'a [u8],
     pub timestamp: std::time::SystemTime,
-    pub len: u32,
-    pub caplen: u32,
 }
 
 pub enum PacketSource {
-    Live(Capture<pcap::Active>),
-    File(Capture<pcap::Offline>),
+    Live(Capture<pcap::Active>, LinkType),
+    File(Capture<pcap::Offline>, LinkType),
 }
 
 impl PacketSource {
-    pub fn live(interface: &str, snaplen: i32, promisc: bool, bpf: Option<&str>) -> Result<Self> {
-        let device = if interface == "any" {
-            Device::lookup()?.context("No capture device found")?
-        } else {
-            Device::list()?
+    pub fn link_type(&self) -> LinkType {
+        match self {
+            PacketSource::Live(_, lt) | PacketSource::File(_, lt) => *lt,
+        }
+    }
+
+    pub fn live(
+        interface: Option<&str>,
+        snaplen: i32,
+        promisc: bool,
+        bpf: Option<&str>,
+    ) -> Result<Self> {
+        let device = match interface {
+            Some(name) => Device::list()?
                 .into_iter()
-                .find(|d| d.name == interface)
-                .context(format!("Interface '{}' not found", interface))?
+                .find(|d| d.name == name)
+                .context(format!("Interface '{}' not found", name))?,
+            None => Device::lookup()?.context("No capture device found")?,
         };
 
         let mut cap = Capture::from_device(device)?
@@ -39,7 +49,8 @@ impl PacketSource {
                 .context(format!("Invalid BPF filter: {}", filter))?;
         }
 
-        Ok(PacketSource::Live(cap))
+        let lt = link_type_from_pcap(cap.get_datalink());
+        Ok(PacketSource::Live(cap, lt))
     }
 
     pub fn from_file(path: &Path, bpf: Option<&str>) -> Result<Self> {
@@ -51,7 +62,8 @@ impl PacketSource {
                 .context(format!("Invalid BPF filter: {}", filter))?;
         }
 
-        Ok(PacketSource::File(cap))
+        let lt = link_type_from_pcap(cap.get_datalink());
+        Ok(PacketSource::File(cap, lt))
     }
 
     /// Iterate over packets, calling `f` for each one.
@@ -62,8 +74,8 @@ impl PacketSource {
     {
         loop {
             let raw = match self {
-                PacketSource::Live(cap) => cap.next_packet(),
-                PacketSource::File(cap) => cap.next_packet(),
+                PacketSource::Live(cap, _) => cap.next_packet(),
+                PacketSource::File(cap, _) => cap.next_packet(),
             };
 
             match raw {
@@ -77,8 +89,6 @@ impl PacketSource {
                     let pkt = PacketData {
                         data: packet.data,
                         timestamp: ts,
-                        len: packet.header.len,
-                        caplen: packet.header.caplen,
                     };
 
                     if !f(pkt) {
@@ -92,5 +102,21 @@ impl PacketSource {
         }
 
         Ok(())
+    }
+}
+
+fn link_type_from_pcap(dl: pcap::Linktype) -> LinkType {
+    match dl.0 {
+        1 => LinkType::Ethernet,     // DLT_EN10MB
+        12 | 101 => LinkType::RawIp, // DLT_RAW
+        113 => LinkType::LinuxSll,   // DLT_LINUX_SLL
+        _ => {
+            eprintln!(
+                "Warning: unsupported link type {} ({}), assuming Ethernet",
+                dl.get_name().unwrap_or_default(),
+                dl.0
+            );
+            LinkType::Ethernet
+        }
     }
 }

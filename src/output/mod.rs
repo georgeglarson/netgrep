@@ -27,7 +27,7 @@ impl Formatter {
     }
 
     pub fn print_packet(&self, packet: &ParsedPacket, pattern: &Option<Regex>) {
-        if self.dns && packet.transport == Transport::Udp && is_dns_port(packet) {
+        if self.dns && packet.transport == Transport::Udp && packet.is_dns_port() {
             if let Some(info) = dns::parse_dns(&packet.payload) {
                 if self.json {
                     self.print_dns_json(packet, &info);
@@ -189,8 +189,16 @@ impl Formatter {
 
         if info.is_response {
             // Response line
-            let qname = info.questions.first().map(|q| q.name.as_str()).unwrap_or("?");
-            let qtype = info.questions.first().map(|q| q.qtype.as_str()).unwrap_or("?");
+            let qname = info
+                .questions
+                .first()
+                .map(|q| q.name.as_str())
+                .unwrap_or("?");
+            let qtype = info
+                .questions
+                .first()
+                .map(|q| q.qtype.as_str())
+                .unwrap_or("?");
             let rcode = dns::rcode_str(info.rcode);
 
             if !self.quiet {
@@ -217,8 +225,16 @@ impl Formatter {
             }
         } else {
             // Query line
-            let qname = info.questions.first().map(|q| q.name.as_str()).unwrap_or("?");
-            let qtype = info.questions.first().map(|q| q.qtype.as_str()).unwrap_or("?");
+            let qname = info
+                .questions
+                .first()
+                .map(|q| q.name.as_str())
+                .unwrap_or("?");
+            let qtype = info
+                .questions
+                .first()
+                .map(|q| q.qtype.as_str())
+                .unwrap_or("?");
 
             if !self.quiet {
                 eprintln!(
@@ -245,10 +261,6 @@ impl Formatter {
         });
         println!("{}", j);
     }
-}
-
-fn is_dns_port(packet: &ParsedPacket) -> bool {
-    packet.src_port == Some(53) || packet.dst_port == Some(53)
 }
 
 /// Print payload with regex matches highlighted in red.
