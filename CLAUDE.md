@@ -25,7 +25,8 @@ src/
 ├── protocol/
 │   ├── mod.rs          # Packet parsing, Transport enum, StreamKey, TcpFlags
 │   ├── dns.rs          # DNS query/response parser (via simple-dns)
-│   └── http.rs         # HTTP/1.1 request/response parser
+│   ├── http.rs         # HTTP/1.1 request/response parser
+│   └── http2.rs        # HTTP/2 frame parser + HPACK decoder (auto-detects via connection preface)
 ├── reassembly/mod.rs   # StreamTable: TCP stream reassembly (emits on PSH/FIN/RST)
 ├── output/mod.rs       # Formatter: text (color-highlighted), JSON, hex dump, HTTP mode
 ├── tls/
@@ -47,10 +48,11 @@ src/
 - Case-insensitive (`-i`) and inverted (`-v`) matching
 - Interface listing (`-L`)
 - Packet count limit (`-n`)
-- `--http` flag: HTTP/1.1-aware mode (parse headers, match against fields)
+- `--http` flag: HTTP/1.1 and HTTP/2 aware mode (parse headers, match against fields; HTTP/2 auto-detected via connection preface)
 - `--dns` flag: DNS-aware mode (parse queries/responses, match against domain names and record data)
-- `--keylog` / `SSLKEYLOGFILE`: TLS 1.3 decryption (AES-128-GCM, AES-256-GCM) — tested
+- `--keylog` / `SSLKEYLOGFILE`: TLS 1.3 decryption (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305) — tested
 - TLS 1.2 AES-GCM decryption (ECDHE-ECDSA, ECDHE-RSA, RSA key exchange) — tested
+- TLS 1.2 ChaCha20-Poly1305 decryption (ECDHE-ECDSA, ECDHE-RSA) — tested
 - `-O` / `--output-file`: write matched packets to pcap file
 - `--tui`: interactive terminal UI mode (ratatui) — packet table + detail pane + status bar
 
@@ -59,7 +61,7 @@ src/
 ### Phase 2 — AI + polish
 - Ollama integration for natural language to BPF filter conversion
 - Traffic summarization (`--summarize`)
-- HTTP/2 + gRPC protocol support
+- gRPC protocol support (HTTP/2 is implemented)
 - Anomaly flagging
 - Container name resolution (Docker/Podman)
 

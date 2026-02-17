@@ -17,6 +17,7 @@ pub struct Tls13Secrets {
     pub server_handshake_traffic_secret: Option<Vec<u8>>,
     pub client_traffic_secret_0: Option<Vec<u8>>,
     pub server_traffic_secret_0: Option<Vec<u8>>,
+    pub client_early_traffic_secret: Option<Vec<u8>>,
 }
 
 impl KeyLog {
@@ -81,6 +82,13 @@ impl KeyLog {
                         .entry(client_random)
                         .or_default()
                         .server_traffic_secret_0 = Some(secret);
+                }
+                "CLIENT_EARLY_TRAFFIC_SECRET" => {
+                    keylog
+                        .tls13_secrets
+                        .entry(client_random)
+                        .or_default()
+                        .client_early_traffic_secret = Some(secret);
                 }
                 _ => {}
             }

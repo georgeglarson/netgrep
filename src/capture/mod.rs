@@ -28,6 +28,7 @@ impl PacketSource {
         snaplen: i32,
         promisc: bool,
         bpf: Option<&str>,
+        buffer_size: Option<i32>,
     ) -> Result<Self> {
         let device = match interface {
             Some(name) => Device::list()?
@@ -37,19 +38,23 @@ impl PacketSource {
             None => Device::lookup()?.context("No capture device found")?,
         };
 
-        let mut cap = Capture::from_device(device)?
+        let mut builder = Capture::from_device(device)?
             .snaplen(snaplen)
             .promisc(promisc)
-            .timeout(1000)
-            .open()
-            .context("Failed to open capture device")?;
+            .timeout(1000);
+
+        if let Some(kb) = buffer_size {
+            builder = builder.buffer_size(kb * 1024);
+        }
+
+        let mut cap = builder.open().context("Failed to open capture device")?;
 
         if let Some(filter) = bpf {
             cap.filter(filter, true)
                 .context(format!("Invalid BPF filter: {}", filter))?;
         }
 
-        let lt = link_type_from_pcap(cap.get_datalink());
+        let lt = link_type_from_pcap(cap.get_datalink())?;
         Ok(PacketSource::Live(cap, lt))
     }
 
@@ -62,7 +67,7 @@ impl PacketSource {
                 .context(format!("Invalid BPF filter: {}", filter))?;
         }
 
-        let lt = link_type_from_pcap(cap.get_datalink());
+        let lt = link_type_from_pcap(cap.get_datalink())?;
         Ok(PacketSource::File(cap, lt))
     }
 
@@ -108,18 +113,19 @@ impl PacketSource {
     }
 }
 
-fn link_type_from_pcap(dl: pcap::Linktype) -> LinkType {
+fn link_type_from_pcap(dl: pcap::Linktype) -> Result<LinkType> {
     match dl.0 {
-        1 => LinkType::Ethernet,     // DLT_EN10MB
-        12 | 101 => LinkType::RawIp, // DLT_RAW
-        113 => LinkType::LinuxSll,   // DLT_LINUX_SLL
+        1 => Ok(LinkType::Ethernet),     // DLT_EN10MB
+        12 | 101 => Ok(LinkType::RawIp), // DLT_RAW
+        113 => Ok(LinkType::LinuxSll),   // DLT_LINUX_SLL
+        276 => Ok(LinkType::LinuxSll2),  // DLT_LINUX_SLL2
         _ => {
-            eprintln!(
-                "Warning: unsupported link type {} ({}), assuming Ethernet",
+            anyhow::bail!(
+                "Unsupported link type: {} (DLT {}). \
+                 Supported: Ethernet (1), Raw IP (12/101), Linux SLL (113), Linux SLL2 (276)",
                 dl.get_name().unwrap_or_default(),
                 dl.0
             );
-            LinkType::Ethernet
         }
     }
 }

@@ -1,5 +1,6 @@
 pub mod dns;
 pub mod http;
+pub mod http2;
 
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use std::net::IpAddr;
@@ -9,6 +10,7 @@ use std::net::IpAddr;
 pub enum LinkType {
     Ethernet,
     LinuxSll,
+    LinuxSll2,
     RawIp,
 }
 
@@ -16,9 +18,10 @@ impl LinkType {
     /// Return the pcap link-layer header type value (DLT_*).
     pub fn pcap_link_type(self) -> u32 {
         match self {
-            LinkType::Ethernet => 1,   // DLT_EN10MB
-            LinkType::RawIp => 101,    // DLT_RAW
-            LinkType::LinuxSll => 113, // DLT_LINUX_SLL
+            LinkType::Ethernet => 1,    // DLT_EN10MB
+            LinkType::RawIp => 101,     // DLT_RAW
+            LinkType::LinuxSll => 113,  // DLT_LINUX_SLL
+            LinkType::LinuxSll2 => 276, // DLT_LINUX_SLL2
         }
     }
 }
@@ -34,6 +37,14 @@ pub struct ParsedPacket {
     pub payload: Vec<u8>,
     pub tcp_flags: Option<TcpFlags>,
     pub seq: Option<u32>,
+    /// VLAN ID (from 802.1Q header), if present.
+    pub vlan_id: Option<u16>,
+    /// ICMP type (for ICMP packets only).
+    pub icmp_type: Option<u8>,
+    /// ICMP code (for ICMP packets only).
+    pub icmp_code: Option<u8>,
+    /// Packet timestamp for display.
+    pub timestamp: Option<std::time::SystemTime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,14 +69,14 @@ impl ParsedPacket {
         self.transport == Transport::Tcp
     }
 
-    /// Check if this packet is on a DNS port (53 or 5353/mDNS).
+    /// Check if this packet is on a DNS port (53, 853/DoT, or 5353/mDNS).
     pub fn is_dns_port(&self) -> bool {
-        const DNS_PORTS: [u16; 2] = [53, 5353];
+        const DNS_PORTS: [u16; 3] = [53, 853, 5353];
         self.src_port.is_some_and(|p| DNS_PORTS.contains(&p))
             || self.dst_port.is_some_and(|p| DNS_PORTS.contains(&p))
     }
 
-    /// Return payload as a lossy UTF-8 string for matching.
+    /// Return payload as a lossy UTF-8 string for display.
     pub fn payload_str(&self) -> String {
         String::from_utf8_lossy(&self.payload).into_owned()
     }
@@ -143,9 +154,32 @@ pub fn parse_packet(data: &[u8], link_type: LinkType) -> Option<ParsedPacket> {
             if data.len() < 16 {
                 return None;
             }
-            SlicedPacket::from_ip(&data[16..]).ok()?
+            // Check protocol type at bytes 14-15
+            let proto = u16::from_be_bytes([data[14], data[15]]);
+            match proto {
+                0x0800 | 0x86DD => SlicedPacket::from_ip(&data[16..]).ok()?,
+                _ => return None, // Not IP — skip (e.g. ARP)
+            }
+        }
+        LinkType::LinuxSll2 => {
+            // Linux cooked capture v2: 20-byte header, then IP packet
+            if data.len() < 20 {
+                return None;
+            }
+            // Protocol type at bytes 0-1 in SLL2
+            let proto = u16::from_be_bytes([data[0], data[1]]);
+            match proto {
+                0x0800 | 0x86DD => SlicedPacket::from_ip(&data[20..]).ok()?,
+                _ => return None,
+            }
         }
     };
+
+    // Extract VLAN ID from etherparse link extensions
+    let vlan_id = sliced.vlan().map(|v| match v {
+        etherparse::VlanSlice::SingleVlan(s) => s.vlan_identifier().value(),
+        etherparse::VlanSlice::DoubleVlan(d) => d.outer.vlan_identifier().value(),
+    });
 
     let (src_ip, dst_ip) = match &sliced.net {
         Some(NetSlice::Ipv4(ipv4)) => (
@@ -159,42 +193,79 @@ pub fn parse_packet(data: &[u8], link_type: LinkType) -> Option<ParsedPacket> {
         _ => (None, None),
     };
 
-    let (src_port, dst_port, transport, tcp_flags, seq, payload) = match &sliced.transport {
-        Some(TransportSlice::Tcp(tcp)) => (
-            Some(tcp.source_port()),
-            Some(tcp.destination_port()),
-            Transport::Tcp,
-            Some(TcpFlags {
-                syn: tcp.syn(),
-                ack: tcp.ack(),
-                fin: tcp.fin(),
-                rst: tcp.rst(),
-                psh: tcp.psh(),
-            }),
-            Some(tcp.sequence_number()),
-            tcp.payload().to_vec(),
-        ),
-        Some(TransportSlice::Udp(udp)) => (
-            Some(udp.source_port()),
-            Some(udp.destination_port()),
-            Transport::Udp,
-            None,
-            None,
-            udp.payload().to_vec(),
-        ),
-        Some(TransportSlice::Icmpv4(_)) | Some(TransportSlice::Icmpv6(_)) => (
-            None,
-            None,
-            Transport::Icmp,
-            None,
-            None,
-            sliced
-                .ip_payload()
-                .map(|p| p.payload.to_vec())
-                .unwrap_or_default(),
-        ),
-        _ => (None, None, Transport::Other, None, None, Vec::new()),
-    };
+    let (src_port, dst_port, transport, tcp_flags, seq, payload, icmp_type, icmp_code) =
+        match &sliced.transport {
+            Some(TransportSlice::Tcp(tcp)) => (
+                Some(tcp.source_port()),
+                Some(tcp.destination_port()),
+                Transport::Tcp,
+                Some(TcpFlags {
+                    syn: tcp.syn(),
+                    ack: tcp.ack(),
+                    fin: tcp.fin(),
+                    rst: tcp.rst(),
+                    psh: tcp.psh(),
+                }),
+                Some(tcp.sequence_number()),
+                tcp.payload().to_vec(),
+                None,
+                None,
+            ),
+            Some(TransportSlice::Udp(udp)) => (
+                Some(udp.source_port()),
+                Some(udp.destination_port()),
+                Transport::Udp,
+                None,
+                None,
+                udp.payload().to_vec(),
+                None,
+                None,
+            ),
+            Some(TransportSlice::Icmpv4(icmp)) => {
+                let ip_payload = sliced
+                    .ip_payload()
+                    .map(|p| p.payload.to_vec())
+                    .unwrap_or_default();
+                let (itype, icode) = icmpv4_type_code(icmp);
+                (
+                    None,
+                    None,
+                    Transport::Icmp,
+                    None,
+                    None,
+                    ip_payload,
+                    Some(itype),
+                    Some(icode),
+                )
+            }
+            Some(TransportSlice::Icmpv6(icmp)) => {
+                let ip_payload = sliced
+                    .ip_payload()
+                    .map(|p| p.payload.to_vec())
+                    .unwrap_or_default();
+                let (itype, icode) = icmpv6_type_code(icmp);
+                (
+                    None,
+                    None,
+                    Transport::Icmp,
+                    None,
+                    None,
+                    ip_payload,
+                    Some(itype),
+                    Some(icode),
+                )
+            }
+            _ => (
+                None,
+                None,
+                Transport::Other,
+                None,
+                None,
+                Vec::new(),
+                None,
+                None,
+            ),
+        };
 
     Some(ParsedPacket {
         src_ip,
@@ -205,7 +276,31 @@ pub fn parse_packet(data: &[u8], link_type: LinkType) -> Option<ParsedPacket> {
         payload,
         tcp_flags,
         seq,
+        vlan_id,
+        icmp_type,
+        icmp_code,
+        timestamp: None,
     })
+}
+
+/// Extract ICMPv4 type and code from the slice.
+fn icmpv4_type_code(icmp: &etherparse::Icmpv4Slice) -> (u8, u8) {
+    let bytes = icmp.slice();
+    if bytes.len() >= 2 {
+        (bytes[0], bytes[1])
+    } else {
+        (0, 0)
+    }
+}
+
+/// Extract ICMPv6 type and code from the slice.
+fn icmpv6_type_code(icmp: &etherparse::Icmpv6Slice) -> (u8, u8) {
+    let bytes = icmp.slice();
+    if bytes.len() >= 2 {
+        (bytes[0], bytes[1])
+    } else {
+        (0, 0)
+    }
 }
 
 #[cfg(test)]
@@ -283,6 +378,10 @@ mod tests {
             payload: Vec::new(),
             tcp_flags: None,
             seq: None,
+            vlan_id: None,
+            icmp_type: None,
+            icmp_code: None,
+            timestamp: None,
         }
     }
 
@@ -299,6 +398,11 @@ mod tests {
     #[test]
     fn is_dns_port_mdns_5353() {
         assert!(make_udp_packet(Some(5353), Some(5353)).is_dns_port());
+    }
+
+    #[test]
+    fn is_dns_port_dot_853() {
+        assert!(make_udp_packet(Some(853), Some(12345)).is_dns_port());
     }
 
     #[test]
@@ -420,9 +524,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_linux_sll2_packet() {
+        let eth = build_eth_udp_packet([172, 16, 0, 1], [172, 16, 0, 2], 1234, 80, b"test");
+        let ip_data = &eth[14..];
+
+        // Build a fake Linux SLL v2 header (20 bytes)
+        let mut sll2 = vec![0u8; 20];
+        sll2[0] = 0x08; // Protocol type: IPv4 (0x0800) at bytes 0-1
+        sll2[1] = 0x00;
+        sll2.extend_from_slice(ip_data);
+
+        let pkt = parse_packet(&sll2, LinkType::LinuxSll2).unwrap();
+        assert_eq!(pkt.src_ip, Some(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert_eq!(pkt.transport, Transport::Udp);
+    }
+
+    #[test]
     fn parse_linux_sll_too_short() {
         let data = vec![0u8; 10]; // Less than 16 bytes
         assert!(parse_packet(&data, LinkType::LinuxSll).is_none());
+    }
+
+    #[test]
+    fn parse_linux_sll_non_ip_protocol() {
+        // ARP (0x0806) should be skipped
+        let mut sll = vec![0u8; 16];
+        sll[14] = 0x08;
+        sll[15] = 0x06; // ARP
+        sll.extend_from_slice(&[0u8; 28]); // dummy ARP payload
+        assert!(parse_packet(&sll, LinkType::LinuxSll).is_none());
     }
 
     #[test]

@@ -39,6 +39,8 @@ struct TlsConnection {
     decrypted_emitted: usize,
     /// Monotonic tick updated on each packet for LRU eviction.
     last_active: u64,
+    /// IV length from cipher suite (4 for AES-GCM, 12 for ChaCha20/TLS 1.3).
+    iv_len: usize,
 }
 
 impl TlsConnection {
@@ -60,6 +62,7 @@ impl TlsConnection {
             decrypted: Vec::new(),
             decrypted_emitted: 0,
             last_active: 0,
+            iv_len: 4,
         }
     }
 
@@ -301,36 +304,40 @@ impl TlsDecryptor {
     }
 
     fn try_derive_keys(&mut self, key: &StreamKey) {
-        let conn = match self.connections.get(key) {
-            Some(c) => c,
-            None => return,
+        // Extract all needed values from the immutable borrow, then release it
+        let (client_random, cipher, version) = {
+            let conn = match self.connections.get(key) {
+                Some(c) => c,
+                None => return,
+            };
+            if conn.client_keys.is_some() {
+                return;
+            }
+            let cr = match conn.client_random {
+                Some(cr) => cr,
+                None => return,
+            };
+            let cs = match conn.cipher_suite {
+                Some(c) => c,
+                None => return,
+            };
+            (cr, cs, conn.version.unwrap_or(TlsVersion::Tls12))
         };
 
-        if conn.client_keys.is_some() {
-            return;
-        }
-
-        let client_random = match conn.client_random {
-            Some(cr) => cr,
-            None => return,
-        };
-
-        let cipher = match conn.cipher_suite {
-            Some(c) => c,
-            None => return,
-        };
-
-        let (aead_algo, hash_algo, key_len) = match handshake::cipher_suite_params(cipher) {
+        let (aead_algo, hash_algo, key_len, iv_len) = match handshake::cipher_suite_params(cipher) {
             Some(p) => p,
             None => return,
         };
 
-        let version = conn.version.unwrap_or(TlsVersion::Tls12);
+        // Store iv_len on the connection for use during decryption
+        if let Some(conn) = self.connections.get_mut(key) {
+            conn.iv_len = iv_len;
+        }
 
         if version == TlsVersion::Tls13 {
             self.derive_tls13_keys(key, &client_random, hash_algo, aead_algo);
         } else {
-            self.derive_tls12_keys(key, &client_random, key_len, aead_algo);
+            self.derive_tls12_keys(key, &client_random, key_len, iv_len, aead_algo);
         }
     }
 
@@ -381,6 +388,7 @@ impl TlsDecryptor {
         key: &StreamKey,
         client_random: &[u8; 32],
         key_len: usize,
+        iv_len: usize,
         aead_algo: &'static aead::Algorithm,
     ) {
         let master_secret = match self.keylog.master_secrets.get(client_random) {
@@ -403,7 +411,7 @@ impl TlsDecryptor {
             client_random,
             &server_random,
             key_len,
-            4, // GCM implicit IV length
+            iv_len,
             aead_algo,
         ) {
             conn.client_keys = Some(client_keys);
@@ -513,6 +521,7 @@ impl TlsDecryptor {
         is_from_client: bool,
     ) -> Option<Vec<u8>> {
         let conn = self.connections.get_mut(key)?;
+        let iv_len = conn.iv_len;
         let keys = if is_from_client {
             conn.client_keys.as_mut()?
         } else {
@@ -521,27 +530,42 @@ impl TlsDecryptor {
 
         let mut ciphertext = record.data.to_vec();
 
-        // TLS 1.2 with GCM: first 8 bytes are explicit nonce, then ciphertext + 16-byte tag
-        // Need at least 8 (nonce) + 16 (GCM tag) = 24 bytes minimum
-        if ciphertext.len() < 24 {
-            return None;
+        if iv_len == 4 {
+            // AES-GCM: first 8 bytes are explicit nonce, then ciphertext + 16-byte tag
+            // Need at least 8 (nonce) + 16 (tag) = 24 bytes minimum
+            if ciphertext.len() < 24 {
+                return None;
+            }
+            let explicit_nonce: Vec<u8> = ciphertext.drain(..8).collect();
+
+            // AAD: seq_num(8) + type(1) + version(2) + plaintext_length(2)
+            let plaintext_len = ciphertext.len() - 16; // minus tag (safe: checked >= 24 above)
+            let mut aad = Vec::with_capacity(13);
+            aad.extend_from_slice(&(keys.seq_num()).to_be_bytes());
+            aad.push(record.hdr.record_type.0);
+            aad.extend_from_slice(&u16::from(record.hdr.version).to_be_bytes());
+            aad.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
+
+            keys.decrypt_tls12_record(&mut ciphertext, &aad, &explicit_nonce)
+                .ok()
+        } else {
+            // ChaCha20-Poly1305: no explicit nonce, 16-byte tag appended
+            // Need at least 16 (tag) bytes
+            if ciphertext.len() < 16 {
+                return None;
+            }
+
+            // AAD: seq_num(8) + type(1) + version(2) + plaintext_length(2)
+            let plaintext_len = ciphertext.len() - 16;
+            let mut aad = Vec::with_capacity(13);
+            aad.extend_from_slice(&(keys.seq_num()).to_be_bytes());
+            aad.push(record.hdr.record_type.0);
+            aad.extend_from_slice(&u16::from(record.hdr.version).to_be_bytes());
+            aad.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
+
+            // Use build_nonce (XOR seq with full 12-byte IV) via decrypt_record
+            keys.decrypt_record(&mut ciphertext, &aad).ok()
         }
-        let explicit_nonce: Vec<u8> = ciphertext.drain(..8).collect();
-
-        // Bail if record length exceeds u16 range (malformed record)
-        let record_len = u16::try_from(record.hdr.len).ok()?;
-
-        // AAD: seq_num(8) + type(1) + version(2) + plaintext_length(2)
-        let plaintext_len = ciphertext.len() - 16; // minus GCM tag (safe: checked >= 24 above)
-        let mut aad = Vec::with_capacity(13);
-        aad.extend_from_slice(&(keys.seq_num()).to_be_bytes());
-        aad.push(record.hdr.record_type.0);
-        aad.extend_from_slice(&u16::from(record.hdr.version).to_be_bytes());
-        let _ = record_len; // length already validated above
-        aad.extend_from_slice(&(plaintext_len as u16).to_be_bytes());
-
-        keys.decrypt_tls12_record(&mut ciphertext, &aad, &explicit_nonce)
-            .ok()
     }
 }
 
@@ -661,5 +685,48 @@ mod tests {
         // Before ClientHello, any sender is treated as client
         let any_ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
         assert!(conn.is_from_client(any_ip, 12345));
+    }
+
+    #[test]
+    fn tls12_chacha20_decrypt_roundtrip() {
+        // Generate a ChaCha20-Poly1305 key and IV, encrypt a record, then verify
+        // the TLS 1.2 ChaCha20 path can decrypt it.
+        use ring::aead::{self, Aad, LessSafeKey, Nonce, UnboundKey};
+
+        let key_bytes = [0x42u8; 32];
+        let iv = [0x01u8; 12];
+
+        // Build the nonce: IV XOR seq_num (seq=0, so nonce == IV)
+        let nonce_bytes = iv; // seq 0 XOR iv = iv
+
+        // Encrypt a test payload
+        let plaintext = b"hello chacha20";
+        let mut in_out = plaintext.to_vec();
+
+        // Build AAD for TLS 1.2: seq(8) + type(1) + version(2) + plaintext_len(2)
+        let mut aad_bytes = Vec::with_capacity(13);
+        aad_bytes.extend_from_slice(&0u64.to_be_bytes()); // seq = 0
+        aad_bytes.push(0x17); // application data
+        aad_bytes.extend_from_slice(&[0x03, 0x03]); // TLS 1.2
+        aad_bytes.extend_from_slice(&(plaintext.len() as u16).to_be_bytes());
+
+        let unbound = UnboundKey::new(&aead::CHACHA20_POLY1305, &key_bytes).unwrap();
+        let sealing_key = LessSafeKey::new(unbound);
+        let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
+        sealing_key
+            .seal_in_place_append_tag(nonce, Aad::from(&aad_bytes), &mut in_out)
+            .unwrap();
+
+        // Now decrypt using DirectionKeys (ChaCha20 path: decrypt_record with XOR nonce)
+        let mut keys =
+            decrypt::DirectionKeys::new(&key_bytes, &iv, &aead::CHACHA20_POLY1305).unwrap();
+        let result = keys.decrypt_record(&mut in_out, &aad_bytes).unwrap();
+        assert_eq!(result, plaintext);
+    }
+
+    #[test]
+    fn tls_connection_default_iv_len() {
+        let conn = TlsConnection::new();
+        assert_eq!(conn.iv_len, 4);
     }
 }

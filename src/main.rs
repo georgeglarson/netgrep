@@ -8,7 +8,7 @@ mod tui;
 use anyhow::{Context, Result};
 use clap::Parser;
 use pcap::Device;
-use regex::Regex;
+use regex::bytes::Regex;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -99,6 +99,14 @@ struct Cli {
     /// Interactive TUI mode
     #[arg(long)]
     tui: bool,
+
+    /// Kernel buffer size in KiB for live capture (default: OS default, typically 2048)
+    #[arg(short = 'B', long)]
+    buffer_size: Option<i32>,
+
+    /// Line-buffered output (flush stdout after each match)
+    #[arg(short = 'l', long)]
+    line_buffered: bool,
 }
 
 fn main() -> Result<()> {
@@ -129,6 +137,7 @@ fn main() -> Result<()> {
             cli.snaplen,
             !cli.no_promisc,
             cli.bpf.as_deref(),
+            cli.buffer_size,
         )?
     };
 
@@ -188,63 +197,49 @@ fn main() -> Result<()> {
     }
 }
 
-/// Feed a TCP packet's payload to the TLS decryptor (if present).
-fn feed_tls(parsed: &protocol::ParsedPacket, decryptor: &mut Option<tls::TlsDecryptor>) {
-    if parsed.is_tcp() {
-        if let Some(decryptor) = decryptor.as_mut() {
-            if let (Some(key), Some(src_ip), Some(src_port)) =
-                (parsed.stream_key(), parsed.src_ip, parsed.src_port)
-            {
-                decryptor.process_packet(&key, &parsed.payload, src_ip, src_port);
-            }
-        }
+/// Feed reassembled (deduped, in-order) stream data to the TLS decryptor.
+/// This is called AFTER TCP reassembly to avoid feeding retransmissions.
+fn feed_tls_stream(
+    key: &protocol::StreamKey,
+    payload: &[u8],
+    src_ip: std::net::IpAddr,
+    src_port: u16,
+    decryptor: &mut Option<tls::TlsDecryptor>,
+) {
+    if let Some(decryptor) = decryptor.as_mut() {
+        decryptor.process_packet(key, payload, src_ip, src_port);
     }
 }
 
 /// Get decrypted TLS payload if available, otherwise return the fallback payload.
 fn resolve_tls_payload(
-    parsed: &protocol::ParsedPacket,
+    key: &protocol::StreamKey,
     decryptor: &mut Option<tls::TlsDecryptor>,
     fallback: &[u8],
 ) -> Vec<u8> {
-    if parsed.is_tcp() {
-        if let Some(decryptor) = decryptor.as_mut() {
-            return parsed
-                .stream_key()
-                .and_then(|key| decryptor.get_decrypted(&key))
-                .unwrap_or_else(|| fallback.to_vec());
-        }
+    if let Some(decryptor) = decryptor.as_mut() {
+        return decryptor
+            .get_decrypted(key)
+            .unwrap_or_else(|| fallback.to_vec());
     }
     fallback.to_vec()
 }
 
 /// Build a match-text string, using DNS display format when in DNS mode.
-fn build_match_text(payload: &[u8], parsed: &protocol::ParsedPacket, dns_mode: bool) -> String {
+fn build_match_text(payload: &[u8], parsed: &protocol::ParsedPacket, dns_mode: bool) -> Vec<u8> {
     if dns_mode && parsed.is_dns_port() {
-        let dns_data = dns_payload(payload, parsed.is_tcp());
+        let dns_data = protocol::dns::strip_tcp_prefix(payload, parsed.is_tcp());
         if let Some(info) = protocol::dns::parse_dns(dns_data) {
-            return info.display_string();
+            return info.display_string().into_bytes();
         }
     }
-    String::from_utf8_lossy(payload).into_owned()
+    payload.to_vec()
 }
 
-/// Strip the 2-byte TCP DNS length prefix if this is a TCP packet.
-/// DNS over TCP prepends a u16 length before the DNS message.
-fn dns_payload(payload: &[u8], is_tcp: bool) -> &[u8] {
-    if is_tcp && payload.len() > 2 {
-        let dns_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-        if dns_len + 2 <= payload.len() {
-            return &payload[2..2 + dns_len];
-        }
-    }
-    payload
-}
-
-/// Check whether text matches the pattern, respecting invert flag.
-fn is_match(text: &str, pattern: &Option<Regex>, invert: bool) -> bool {
+/// Check whether payload matches the pattern, respecting invert flag.
+fn is_match(payload: &[u8], pattern: &Option<Regex>, invert: bool) -> bool {
     match pattern {
-        Some(re) => re.is_match(text) != invert,
+        Some(re) => re.is_match(payload) != invert,
         None => !invert,
     }
 }
@@ -260,7 +255,14 @@ fn run_cli_mode(
     let formatter = Formatter::new(cli.json, cli.hex, cli.quiet, http_mode, cli.dns);
     let mut stream_table = StreamTable::new();
     let mut match_count: usize = 0;
+    let mut packets_seen: u64 = 0;
     let link_type = source.link_type();
+    let line_buffered = cli.line_buffered;
+    let mut h2_tracker = if http_mode {
+        Some(protocol::http2::H2Tracker::new())
+    } else {
+        None
+    };
 
     let mut pcap_writer = match &cli.output_file {
         Some(path) => {
@@ -276,38 +278,106 @@ fn run_cli_mode(
             return false;
         }
 
-        let parsed = match protocol::parse_packet(packet_data.data, link_type) {
+        packets_seen += 1;
+
+        let mut parsed = match protocol::parse_packet(packet_data.data, link_type) {
             Some(p) => p,
             None => return true,
         };
-
-        feed_tls(&parsed, tls_decryptor);
+        parsed.timestamp = Some(packet_data.timestamp);
 
         if !cli.no_reassemble && parsed.is_tcp() {
             if let Some(stream_data) = stream_table.process(&parsed) {
-                let effective_payload =
-                    resolve_tls_payload(&parsed, tls_decryptor, &stream_data.payload);
-                let effective_str = String::from_utf8_lossy(&effective_payload);
-                if is_match(&effective_str, pattern, cli.invert) {
-                    let display_data = reassembly::StreamData {
-                        key: stream_data.key,
-                        payload: effective_payload,
+                // Feed TLS decryptor with deduped, in-order stream data
+                if let Some(key) = parsed.stream_key() {
+                    let (src_ip, src_port) = direction_src(&parsed, &stream_data.direction);
+                    feed_tls_stream(&key, &stream_data.payload, src_ip, src_port, tls_decryptor);
+
+                    let effective_payload =
+                        resolve_tls_payload(&key, tls_decryptor, &stream_data.payload);
+
+                    // Try HTTP/2 parsing if in http mode
+                    let h2_messages = if let Some(ref mut h2) = h2_tracker {
+                        let h2_dir = match stream_data.direction {
+                            reassembly::Direction::Forward => {
+                                protocol::http2::H2Direction::ClientToServer
+                            }
+                            reassembly::Direction::Reverse => {
+                                protocol::http2::H2Direction::ServerToClient
+                            }
+                        };
+                        h2.process(&key, &effective_payload, h2_dir)
+                    } else {
+                        vec![]
                     };
-                    formatter.print_stream(&display_data, pattern);
-                    if let Some(ref mut writer) = pcap_writer {
-                        if let Err(e) = writer.write_packet(packet_data.data, packet_data.timestamp)
-                        {
-                            eprintln!("Warning: failed to write packet to output file: {}", e);
+
+                    if !h2_messages.is_empty() {
+                        // HTTP/2 messages found — match and display individually
+                        let stream_id = key.to_string();
+                        for msg in &h2_messages {
+                            let display = msg.display_string();
+                            if is_match(display.as_bytes(), pattern, cli.invert) {
+                                if cli.json {
+                                    formatter.print_http_json(&stream_id, msg);
+                                } else {
+                                    formatter.print_http_text(&stream_id, msg, pattern);
+                                }
+                                if line_buffered {
+                                    use std::io::Write;
+                                    let _ = std::io::stdout().flush();
+                                }
+                                if let Some(ref mut writer) = pcap_writer {
+                                    if let Err(e) =
+                                        writer.write_packet(packet_data.data, packet_data.timestamp)
+                                    {
+                                        eprintln!(
+                                            "Warning: failed to write packet to output file: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                                match_count += 1;
+                            }
                         }
+                    } else if is_match(&effective_payload, pattern, cli.invert) {
+                        let display_data = reassembly::StreamData {
+                            key: stream_data.key,
+                            payload: effective_payload,
+                            direction: stream_data.direction,
+                        };
+                        formatter.print_stream(&display_data, pattern);
+                        if line_buffered {
+                            use std::io::Write;
+                            let _ = std::io::stdout().flush();
+                        }
+                        if let Some(ref mut writer) = pcap_writer {
+                            if let Err(e) =
+                                writer.write_packet(packet_data.data, packet_data.timestamp)
+                            {
+                                eprintln!("Warning: failed to write packet to output file: {}", e);
+                            }
+                        }
+                        match_count += 1;
                     }
-                    match_count += 1;
                 }
             }
         } else {
-            let payload = resolve_tls_payload(&parsed, tls_decryptor, &parsed.payload);
+            let payload = if parsed.is_tcp() {
+                if let Some(key) = parsed.stream_key() {
+                    resolve_tls_payload(&key, tls_decryptor, &parsed.payload)
+                } else {
+                    parsed.payload.clone()
+                }
+            } else {
+                parsed.payload.clone()
+            };
             let match_text = build_match_text(&payload, &parsed, cli.dns);
             if is_match(&match_text, pattern, cli.invert) {
                 formatter.print_packet(&parsed, pattern);
+                if line_buffered {
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                }
                 if let Some(ref mut writer) = pcap_writer {
                     if let Err(e) = writer.write_packet(packet_data.data, packet_data.timestamp) {
                         eprintln!("Warning: failed to write packet to output file: {}", e);
@@ -323,7 +393,31 @@ fn run_cli_mode(
         }
     })?;
 
+    // Print capture statistics
+    eprintln!("{} packets seen, {} matches", packets_seen, match_count);
+
     Ok(())
+}
+
+/// Determine the source IP and port for a given direction.
+fn direction_src(
+    parsed: &protocol::ParsedPacket,
+    direction: &reassembly::Direction,
+) -> (std::net::IpAddr, u16) {
+    match direction {
+        reassembly::Direction::Forward => (
+            parsed
+                .src_ip
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            parsed.src_port.unwrap_or(0),
+        ),
+        reassembly::Direction::Reverse => (
+            parsed
+                .dst_ip
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            parsed.dst_port.unwrap_or(0),
+        ),
+    }
 }
 
 fn run_tui_mode(
@@ -349,6 +443,11 @@ fn run_tui_mode(
         let mut stream_table = StreamTable::new();
         let mut event_id: usize = 0;
         let mut match_count: usize = 0;
+        let mut h2_tracker = if http_mode {
+            Some(protocol::http2::H2Tracker::new())
+        } else {
+            None
+        };
 
         source.for_each_packet(|packet_data| {
             if capture_stop.load(Ordering::Relaxed) {
@@ -357,37 +456,88 @@ fn run_tui_mode(
 
             capture_seen.fetch_add(1, Ordering::Relaxed);
 
-            let parsed = match protocol::parse_packet(packet_data.data, link_type) {
+            let mut parsed = match protocol::parse_packet(packet_data.data, link_type) {
                 Some(p) => p,
                 None => return true,
             };
-
-            feed_tls(&parsed, &mut tls_decryptor);
+            parsed.timestamp = Some(packet_data.timestamp);
 
             if reassemble && parsed.is_tcp() {
                 if let Some(stream_data) = stream_table.process(&parsed) {
-                    let effective_payload =
-                        resolve_tls_payload(&parsed, &mut tls_decryptor, &stream_data.payload);
-                    let effective_str = String::from_utf8_lossy(&effective_payload);
-                    if is_match(&effective_str, &pattern, invert) {
-                        event_id += 1;
-                        let display_data = reassembly::StreamData {
-                            key: stream_data.key,
-                            payload: effective_payload,
-                        };
-                        let event = tui::event::CaptureEvent::from_stream(
-                            event_id,
-                            &display_data,
-                            http_mode,
+                    // Feed TLS with deduped data
+                    if let Some(key) = parsed.stream_key() {
+                        let (src_ip, src_port) = direction_src(&parsed, &stream_data.direction);
+                        feed_tls_stream(
+                            &key,
+                            &stream_data.payload,
+                            src_ip,
+                            src_port,
+                            &mut tls_decryptor,
                         );
-                        if tx.send(event).is_err() {
-                            return false;
+                        let effective_payload =
+                            resolve_tls_payload(&key, &mut tls_decryptor, &stream_data.payload);
+
+                        // Try HTTP/2 parsing
+                        let h2_messages = if let Some(ref mut h2) = h2_tracker {
+                            let h2_dir = match stream_data.direction {
+                                reassembly::Direction::Forward => {
+                                    protocol::http2::H2Direction::ClientToServer
+                                }
+                                reassembly::Direction::Reverse => {
+                                    protocol::http2::H2Direction::ServerToClient
+                                }
+                            };
+                            h2.process(&key, &effective_payload, h2_dir)
+                        } else {
+                            vec![]
+                        };
+
+                        if !h2_messages.is_empty() {
+                            // HTTP/2 messages — match against display text
+                            for msg in &h2_messages {
+                                let display = msg.display_string();
+                                if is_match(display.as_bytes(), &pattern, invert) {
+                                    event_id += 1;
+                                    let event = tui::event::CaptureEvent::from_h2_messages(
+                                        event_id,
+                                        &key,
+                                        std::slice::from_ref(msg),
+                                    );
+                                    if tx.send(event).is_err() {
+                                        return false;
+                                    }
+                                    match_count += 1;
+                                }
+                            }
+                        } else if is_match(&effective_payload, &pattern, invert) {
+                            event_id += 1;
+                            let display_data = reassembly::StreamData {
+                                key: stream_data.key,
+                                payload: effective_payload,
+                                direction: stream_data.direction,
+                            };
+                            let event = tui::event::CaptureEvent::from_stream(
+                                event_id,
+                                &display_data,
+                                http_mode,
+                            );
+                            if tx.send(event).is_err() {
+                                return false;
+                            }
+                            match_count += 1;
                         }
-                        match_count += 1;
                     }
                 }
             } else {
-                let payload = resolve_tls_payload(&parsed, &mut tls_decryptor, &parsed.payload);
+                let payload = if parsed.is_tcp() {
+                    if let Some(key) = parsed.stream_key() {
+                        resolve_tls_payload(&key, &mut tls_decryptor, &parsed.payload)
+                    } else {
+                        parsed.payload.clone()
+                    }
+                } else {
+                    parsed.payload.clone()
+                };
                 let match_text = build_match_text(&payload, &parsed, dns_mode);
                 if is_match(&match_text, &pattern, invert) {
                     event_id += 1;

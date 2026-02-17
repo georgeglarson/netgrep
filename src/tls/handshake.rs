@@ -108,23 +108,72 @@ pub(crate) fn parse_handshake(
     Some(result)
 }
 
-/// Map TLS cipher suite ID to (AEAD algorithm, HKDF algorithm, key length).
+/// Map TLS cipher suite ID to (AEAD algorithm, HKDF algorithm, key length, IV length).
+///
+/// `iv_len` determines TLS 1.2 nonce construction:
+/// - 4: AES-GCM implicit IV (4 bytes from key block, 8-byte explicit nonce in record)
+/// - 12: ChaCha20 / TLS 1.3 style (full 12-byte IV from key block, XOR with seq num)
 pub(crate) fn cipher_suite_params(
     cipher: TlsCipherSuiteID,
-) -> Option<(&'static aead::Algorithm, hkdf::Algorithm, usize)> {
+) -> Option<(&'static aead::Algorithm, hkdf::Algorithm, usize, usize)> {
     match cipher.0 {
         // TLS 1.3 cipher suites
-        0x1301 => Some((&aead::AES_128_GCM, hkdf::HKDF_SHA256, 16)), // TLS_AES_128_GCM_SHA256
-        0x1302 => Some((&aead::AES_256_GCM, hkdf::HKDF_SHA384, 32)), // TLS_AES_256_GCM_SHA384
+        0x1301 => Some((&aead::AES_128_GCM, hkdf::HKDF_SHA256, 16, 12)), // TLS_AES_128_GCM_SHA256
+        0x1302 => Some((&aead::AES_256_GCM, hkdf::HKDF_SHA384, 32, 12)), // TLS_AES_256_GCM_SHA384
+        0x1303 => Some((&aead::CHACHA20_POLY1305, hkdf::HKDF_SHA256, 32, 12)), // TLS_CHACHA20_POLY1305_SHA256
 
-        // TLS 1.2 common AES-GCM suites
-        0x009C => Some((&aead::AES_128_GCM, hkdf::HKDF_SHA256, 16)), // TLS_RSA_WITH_AES_128_GCM_SHA256
-        0x009D => Some((&aead::AES_256_GCM, hkdf::HKDF_SHA384, 32)), // TLS_RSA_WITH_AES_256_GCM_SHA384
-        0xC02F => Some((&aead::AES_128_GCM, hkdf::HKDF_SHA256, 16)), // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
-        0xC030 => Some((&aead::AES_256_GCM, hkdf::HKDF_SHA384, 32)), // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
-        0xC02B => Some((&aead::AES_128_GCM, hkdf::HKDF_SHA256, 16)), // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
-        0xC02C => Some((&aead::AES_256_GCM, hkdf::HKDF_SHA384, 32)), // TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        // TLS 1.2 AES-GCM suites (4-byte implicit IV)
+        0x009C => Some((&aead::AES_128_GCM, hkdf::HKDF_SHA256, 16, 4)), // TLS_RSA_WITH_AES_128_GCM_SHA256
+        0x009D => Some((&aead::AES_256_GCM, hkdf::HKDF_SHA384, 32, 4)), // TLS_RSA_WITH_AES_256_GCM_SHA384
+        0xC02F => Some((&aead::AES_128_GCM, hkdf::HKDF_SHA256, 16, 4)), // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        0xC030 => Some((&aead::AES_256_GCM, hkdf::HKDF_SHA384, 32, 4)), // TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        0xC02B => Some((&aead::AES_128_GCM, hkdf::HKDF_SHA256, 16, 4)), // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        0xC02C => Some((&aead::AES_256_GCM, hkdf::HKDF_SHA384, 32, 4)), // TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+
+        // TLS 1.2 ChaCha20-Poly1305 suites (12-byte IV, XOR with seq num)
+        0xCCA8 => Some((&aead::CHACHA20_POLY1305, hkdf::HKDF_SHA256, 32, 12)), // TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+        0xCCA9 => Some((&aead::CHACHA20_POLY1305, hkdf::HKDF_SHA256, 32, 12)), // TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
 
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chacha20_tls13_cipher_suite() {
+        let (algo, _, key_len, iv_len) = cipher_suite_params(TlsCipherSuiteID(0x1303)).unwrap();
+        assert_eq!(algo, &aead::CHACHA20_POLY1305);
+        assert_eq!(key_len, 32);
+        assert_eq!(iv_len, 12);
+    }
+
+    #[test]
+    fn chacha20_tls12_ecdhe_rsa() {
+        let (algo, _, key_len, iv_len) = cipher_suite_params(TlsCipherSuiteID(0xCCA8)).unwrap();
+        assert_eq!(algo, &aead::CHACHA20_POLY1305);
+        assert_eq!(key_len, 32);
+        assert_eq!(iv_len, 12);
+    }
+
+    #[test]
+    fn chacha20_tls12_ecdhe_ecdsa() {
+        let (algo, _, key_len, iv_len) = cipher_suite_params(TlsCipherSuiteID(0xCCA9)).unwrap();
+        assert_eq!(algo, &aead::CHACHA20_POLY1305);
+        assert_eq!(key_len, 32);
+        assert_eq!(iv_len, 12);
+    }
+
+    #[test]
+    fn aes_gcm_has_4_byte_iv() {
+        let (_, _, _, iv_len) = cipher_suite_params(TlsCipherSuiteID(0xC02F)).unwrap();
+        assert_eq!(iv_len, 4);
+    }
+
+    #[test]
+    fn unknown_cipher_suite_returns_none() {
+        assert!(cipher_suite_params(TlsCipherSuiteID(0xFFFF)).is_none());
     }
 }

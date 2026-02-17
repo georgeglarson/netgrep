@@ -28,6 +28,17 @@ pub struct DnsRecord {
     pub rdata: String,
 }
 
+/// Strip the 2-byte TCP DNS length prefix if this is a TCP packet.
+pub fn strip_tcp_prefix<'a>(payload: &'a [u8], is_tcp: bool) -> &'a [u8] {
+    if is_tcp && payload.len() > 2 {
+        let dns_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
+        if dns_len + 2 <= payload.len() {
+            return &payload[2..2 + dns_len];
+        }
+    }
+    payload
+}
+
 pub fn parse_dns(data: &[u8]) -> Option<DnsInfo> {
     let packet = Packet::parse(data).ok()?;
 
@@ -783,5 +794,29 @@ mod tests {
         assert_eq!(info.answers[0].rdata, "10.0.0.1");
         assert_eq!(info.answers[1].rtype, "AAAA");
         assert_eq!(info.answers[1].rdata, "2001:db8::1");
+    }
+
+    #[test]
+    fn strip_tcp_prefix_udp_passthrough() {
+        let data = b"\x00\x05hello";
+        assert_eq!(strip_tcp_prefix(data, false), data.as_slice());
+    }
+
+    #[test]
+    fn strip_tcp_prefix_tcp_strips() {
+        let dns_body = build_query(1, "example.com", TYPE::A);
+        let len = dns_body.len() as u16;
+        let mut tcp_payload = len.to_be_bytes().to_vec();
+        tcp_payload.extend_from_slice(&dns_body);
+
+        let result = strip_tcp_prefix(&tcp_payload, true);
+        assert_eq!(result, dns_body.as_slice());
+    }
+
+    #[test]
+    fn strip_tcp_prefix_short_tcp() {
+        // Less than 2 bytes — return as-is
+        assert_eq!(strip_tcp_prefix(b"x", true), b"x");
+        assert_eq!(strip_tcp_prefix(b"", true), b"");
     }
 }

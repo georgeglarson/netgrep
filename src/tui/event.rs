@@ -53,17 +53,6 @@ impl DetailContent {
     }
 }
 
-/// Strip the 2-byte TCP DNS length prefix if this is a TCP packet.
-fn dns_payload<'a>(payload: &'a [u8], is_tcp: bool) -> &'a [u8] {
-    if is_tcp && payload.len() > 2 {
-        let dns_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-        if dns_len + 2 <= payload.len() {
-            return &payload[2..2 + dns_len];
-        }
-    }
-    payload
-}
-
 fn format_addr(ip: Option<std::net::IpAddr>, port: Option<u16>) -> String {
     format!(
         "{}:{}",
@@ -79,7 +68,7 @@ impl CaptureEvent {
 
         // Check for DNS (strip 2-byte TCP length prefix if needed)
         if dns_mode && parsed.is_dns_port() {
-            let dns_data = dns_payload(&parsed.payload, parsed.is_tcp());
+            let dns_data = dns::strip_tcp_prefix(&parsed.payload, parsed.is_tcp());
             if let Some(info) = dns::parse_dns(dns_data) {
                 return Self::from_dns(id, &src, &dst, &info);
             }
@@ -218,6 +207,16 @@ impl CaptureEvent {
             },
             detail: DetailContent::Dns { header, display },
         }
+    }
+
+    pub fn from_h2_messages(
+        id: usize,
+        stream_key: &crate::protocol::StreamKey,
+        messages: &[HttpMessage],
+    ) -> Self {
+        let src = format!("{}:{}", stream_key.addr_a, stream_key.port_a);
+        let dst = format!("{}:{}", stream_key.addr_b, stream_key.port_b);
+        Self::from_http_messages(id, &src, &dst, &stream_key.to_string(), messages)
     }
 
     fn from_http_messages(

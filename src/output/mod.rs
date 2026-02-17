@@ -1,5 +1,5 @@
 use colored::Colorize;
-use regex::Regex;
+use regex::bytes::Regex;
 use serde_json::json;
 
 use crate::protocol::ParsedPacket;
@@ -28,7 +28,7 @@ impl Formatter {
 
     pub fn print_packet(&self, packet: &ParsedPacket, pattern: &Option<Regex>) {
         if self.dns && packet.is_dns_port() {
-            let dns_data = dns_payload(&packet.payload, packet.is_tcp());
+            let dns_data = dns::strip_tcp_prefix(&packet.payload, packet.is_tcp());
             if let Some(info) = dns::parse_dns(dns_data) {
                 if self.json {
                     self.print_dns_json(packet, &info);
@@ -70,7 +70,19 @@ impl Formatter {
 
     fn print_packet_text(&self, packet: &ParsedPacket, pattern: &Option<Regex>) {
         if !self.quiet {
-            let proto = format!("{:?}", packet.transport);
+            let ts = packet
+                .timestamp
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| {
+                    let secs = d.as_secs();
+                    let usecs = d.subsec_micros();
+                    format!("{}.{:06} ", secs, usecs)
+                })
+                .unwrap_or_default();
+            let proto = match (packet.icmp_type, packet.icmp_code) {
+                (Some(t), Some(c)) => format!("{:?} type={} code={}", packet.transport, t, c),
+                _ => format!("{:?}", packet.transport),
+            };
             let src = format!(
                 "{}:{}",
                 packet.src_ip.map(|i| i.to_string()).unwrap_or_default(),
@@ -81,13 +93,19 @@ impl Formatter {
                 packet.dst_ip.map(|i| i.to_string()).unwrap_or_default(),
                 packet.dst_port.unwrap_or(0)
             );
+            let vlan_tag = match packet.vlan_id {
+                Some(id) => format!(" vlan={}", id),
+                None => String::new(),
+            };
             eprintln!(
-                "{} {} {} {} ({} bytes)",
+                "{}{} {} {} {} ({} bytes){}",
+                ts.dimmed(),
                 proto.blue(),
                 src.green(),
                 "->".dimmed(),
                 dst.yellow(),
-                packet.payload.len()
+                packet.payload.len(),
+                vlan_tag
             );
         }
 
@@ -121,7 +139,7 @@ impl Formatter {
         }
     }
 
-    fn print_http_text(&self, stream_id: &str, msg: &HttpMessage, pattern: &Option<Regex>) {
+    pub fn print_http_text(&self, stream_id: &str, msg: &HttpMessage, pattern: &Option<Regex>) {
         if !self.quiet {
             let label = match &msg.kind {
                 crate::protocol::http::HttpKind::Request { method, uri, .. } => {
@@ -153,6 +171,9 @@ impl Formatter {
             "dst_port": packet.dst_port,
             "payload_len": packet.payload.len(),
             "payload": packet.payload_str(),
+            "vlan_id": packet.vlan_id,
+            "icmp_type": packet.icmp_type,
+            "icmp_code": packet.icmp_code,
         });
         println!("{}", j);
     }
@@ -167,7 +188,7 @@ impl Formatter {
         println!("{}", j);
     }
 
-    fn print_http_json(&self, stream_id: &str, msg: &HttpMessage) {
+    pub fn print_http_json(&self, stream_id: &str, msg: &HttpMessage) {
         let j = json!({
             "type": "http",
             "stream": stream_id,
@@ -268,23 +289,17 @@ impl Formatter {
     }
 }
 
-/// Strip the 2-byte TCP DNS length prefix if this is a TCP packet.
-fn dns_payload<'a>(payload: &'a [u8], is_tcp: bool) -> &'a [u8] {
-    if is_tcp && payload.len() > 2 {
-        let dns_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-        if dns_len + 2 <= payload.len() {
-            return &payload[2..2 + dns_len];
-        }
-    }
-    payload
-}
-
 /// Print payload with regex matches highlighted in red.
 fn print_highlighted(text: &str, pattern: &Option<Regex>) {
     match pattern {
         Some(re) => {
+            let bytes = text.as_bytes();
             let mut last = 0;
-            for m in re.find_iter(text) {
+            for m in re.find_iter(bytes) {
+                // Skip matches that land on non-UTF-8 boundaries (from lossy conversion)
+                if !text.is_char_boundary(m.start()) || !text.is_char_boundary(m.end()) {
+                    continue;
+                }
                 print!("{}", &text[last..m.start()]);
                 print!("{}", text[m.start()..m.end()].red().bold());
                 last = m.end();
