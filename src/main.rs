@@ -101,7 +101,7 @@ struct Cli {
     tui: bool,
 
     /// Kernel buffer size in KiB for live capture (default: OS default, typically 2048)
-    #[arg(short = 'B', long)]
+    #[arg(short = 'B', long, value_parser = clap::value_parser!(i32).range(1..=2_097_151))]
     buffer_size: Option<i32>,
 
     /// Line-buffered output (flush stdout after each match)
@@ -308,7 +308,7 @@ fn run_cli_mode(
             for stream_data in stream_table.process(&parsed) {
                 // Feed TLS decryptor with deduped, in-order stream data
                 if let Some(key) = parsed.stream_key() {
-                    let (src_ip, src_port) = direction_src(&parsed, &stream_data.direction);
+                    let (src_ip, src_port) = stream_data.src_addr;
                     feed_tls_stream(&key, &stream_data.payload, src_ip, src_port, tls_decryptor);
 
                     let effective_payload =
@@ -367,6 +367,7 @@ fn run_cli_mode(
                             key: stream_data.key,
                             payload: effective_payload,
                             direction: stream_data.direction,
+                            src_addr: stream_data.src_addr,
                         };
                         formatter.print_stream(&display_data, pattern);
                         if line_buffered {
@@ -413,27 +414,6 @@ fn run_cli_mode(
     eprintln!("{} packets seen, {} matches", packets_seen, match_count);
 
     Ok(())
-}
-
-/// Determine the source IP and port for a given direction.
-fn direction_src(
-    parsed: &protocol::ParsedPacket,
-    direction: &reassembly::Direction,
-) -> (std::net::IpAddr, u16) {
-    match direction {
-        reassembly::Direction::Forward => (
-            parsed
-                .src_ip
-                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-            parsed.src_port.unwrap_or(0),
-        ),
-        reassembly::Direction::Reverse => (
-            parsed
-                .dst_ip
-                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-            parsed.dst_port.unwrap_or(0),
-        ),
-    }
 }
 
 fn run_tui_mode(
@@ -483,7 +463,7 @@ fn run_tui_mode(
                 for stream_data in stream_table.process(&parsed) {
                     // Feed TLS with deduped data
                     if let Some(key) = parsed.stream_key() {
-                        let (src_ip, src_port) = direction_src(&parsed, &stream_data.direction);
+                        let (src_ip, src_port) = stream_data.src_addr;
                         feed_tls_stream(
                             &key,
                             &stream_data.payload,
@@ -512,6 +492,12 @@ fn run_tui_mode(
                         if !h2_messages.is_empty() {
                             // HTTP/2 messages — match against display text
                             for msg in &h2_messages {
+                                // M3: Check count limit inside H2 message loop
+                                if let Some(n) = count_limit
+                                    && match_count >= n
+                                {
+                                    break;
+                                }
                                 let display = msg.display_string();
                                 if is_match(display.as_bytes(), &pattern, invert) {
                                     event_id += 1;
@@ -532,6 +518,7 @@ fn run_tui_mode(
                                 key: stream_data.key,
                                 payload: effective_payload,
                                 direction: stream_data.direction,
+                                src_addr: stream_data.src_addr,
                             };
                             let event = tui::event::CaptureEvent::from_stream(
                                 event_id,
@@ -546,15 +533,9 @@ fn run_tui_mode(
                     }
                 }
             } else {
-                let payload = if parsed.is_tcp() {
-                    if let Some(key) = parsed.stream_key() {
-                        resolve_tls_payload(&key, &mut tls_decryptor, &parsed.payload)
-                    } else {
-                        parsed.payload.clone()
-                    }
-                } else {
-                    parsed.payload.clone()
-                };
+                // M1/M2: Skip TLS resolution in no-reassemble path — TLS decryption
+                // requires reassembled stream data and won't work per-packet.
+                let payload = parsed.payload.clone();
                 let match_text = build_match_text(&payload, &parsed, dns_mode);
                 if is_match(&match_text, &pattern, invert) {
                     event_id += 1;

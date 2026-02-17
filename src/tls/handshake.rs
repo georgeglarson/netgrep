@@ -79,11 +79,11 @@ pub(crate) fn parse_handshake(
                 }
             }
             TlsMessage::Handshake(TlsMessageHandshake::ServerHello(sh)) => {
-                let mut server_random = [0u8; 32];
                 if sh.random.len() == 32 {
+                    let mut server_random = [0u8; 32];
                     server_random.copy_from_slice(sh.random);
+                    result.server_random = Some(server_random);
                 }
-                result.server_random = Some(server_random);
                 result.cipher_suite = Some(sh.cipher);
 
                 // Only set version from ServerHello if not already determined
@@ -380,6 +380,39 @@ mod tests {
         assert!(result.should_derive);
         // Without supported_versions ext, should get TLS 1.2
         assert_eq!(result.version, Some(TlsVersion::Tls12));
+    }
+
+    #[test]
+    fn parse_server_hello_short_random_skips_server_random() {
+        // H1: ServerHello with short random should not set server_random
+        let mut body = Vec::new();
+        body.push(0x02); // ServerHello
+        body.extend_from_slice(&[0x00, 0x00, 0x00]); // placeholder length
+        body.extend_from_slice(&[0x03, 0x03]); // version
+        // Only 16 bytes of random instead of 32
+        body.extend_from_slice(&[0xBB; 16]);
+        // session_id length: 0
+        body.push(0x00);
+        // cipher_suite
+        body.extend_from_slice(&[0xC0, 0x2F]);
+        // compression: null
+        body.push(0x00);
+        // no extensions
+        body.extend_from_slice(&[0x00, 0x00]);
+
+        let len = body.len() - 4;
+        body[1] = ((len >> 16) & 0xFF) as u8;
+        body[2] = ((len >> 8) & 0xFF) as u8;
+        body[3] = (len & 0xFF) as u8;
+
+        let src_ip: IpAddr = "10.0.0.2".parse().unwrap();
+        let result = parse_handshake(&body, src_ip, 443, None);
+        if let Some(r) = result {
+            assert!(
+                r.server_random.is_none(),
+                "server_random must be None when random is short"
+            );
+        }
     }
 
     #[test]

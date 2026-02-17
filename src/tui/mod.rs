@@ -43,8 +43,9 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
-        // Restore the default panic hook
-        let _ = std::panic::take_hook();
+        // M5: Don't call take_hook() here — it would discard the original hook
+        // captured in the closure. The custom hook is harmless to leave installed
+        // since it just restores the terminal, and the process exits shortly after.
     }
 }
 

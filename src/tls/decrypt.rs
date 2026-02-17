@@ -33,6 +33,9 @@ impl DirectionKeys {
         ciphertext: &mut [u8],
         additional_data: &[u8],
     ) -> Result<Vec<u8>> {
+        if self.seq == u64::MAX {
+            return Err(anyhow::anyhow!("TLS sequence number overflow"));
+        }
         let nonce = self.build_nonce();
 
         let nonce = aead::Nonce::try_assume_unique_for_key(&nonce)
@@ -63,6 +66,9 @@ impl DirectionKeys {
         additional_data: &[u8],
         explicit_nonce: &[u8],
     ) -> Result<Vec<u8>> {
+        if self.seq == u64::MAX {
+            return Err(anyhow::anyhow!("TLS sequence number overflow"));
+        }
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&self.iv[..4]);
         let copy_len = explicit_nonce.len().min(8);
@@ -160,6 +166,10 @@ pub fn derive_tls12_keys(
 
 /// TLS 1.3 HKDF-Expand-Label (RFC 8446 Section 7.1).
 fn hkdf_expand_label(prk: &hkdf::Prk, label: &[u8], context: &[u8], len: usize) -> Result<Vec<u8>> {
+    // H4: Guard against silent truncation of len to u16
+    if len > 65535 {
+        return Err(anyhow::anyhow!("HKDF output length exceeds u16 max"));
+    }
     // Build the HkdfLabel structure:
     // uint16 length
     // opaque label<7..255> = "tls13 " + label
@@ -329,6 +339,44 @@ mod tests {
         assert_eq!(sha384_result.len(), 72);
         // SHA-256 and SHA-384 PRF must produce different key material
         assert_ne!(sha256_result, sha384_result);
+    }
+
+    #[test]
+    fn hkdf_expand_label_rejects_oversized_len() {
+        let prk = hkdf::Prk::new_less_safe(hkdf::HKDF_SHA256, &[0x42; 32]);
+        let result = hkdf_expand_label(&prk, b"key", b"", 65536);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exceeds u16 max"));
+    }
+
+    #[test]
+    fn seq_overflow_returns_error() {
+        let mut keys = make_keys([0u8; 12]);
+        keys.seq = u64::MAX;
+        let mut ct = vec![0u8; 32];
+        let result = keys.decrypt_record(&mut ct, &[0u8; 5]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("sequence number overflow")
+        );
+    }
+
+    #[test]
+    fn seq_overflow_tls12_returns_error() {
+        let mut keys = make_keys([0u8; 12]);
+        keys.seq = u64::MAX;
+        let mut ct = vec![0u8; 32];
+        let result = keys.decrypt_tls12_record(&mut ct, &[0u8; 13], &[0u8; 8]);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("sequence number overflow")
+        );
     }
 
     #[test]

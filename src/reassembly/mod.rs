@@ -216,6 +216,25 @@ impl StreamState {
         }
     }
 
+    /// Return the source (IP, port) for a given direction, using the initiator
+    /// and the StreamKey endpoints. Forward = initiator, Reverse = responder.
+    fn src_addr_for(&self, key: &StreamKey, direction: Direction) -> (IpAddr, u16) {
+        match (direction, self.initiator) {
+            (Direction::Forward, Some(addr)) => addr,
+            (Direction::Reverse, Some((ip, port))) => {
+                // The responder is whichever StreamKey endpoint isn't the initiator
+                if ip == key.addr_a && port == key.port_a {
+                    (key.addr_b, key.port_b)
+                } else {
+                    (key.addr_a, key.port_a)
+                }
+            }
+            // No initiator known — use addr_a for forward, addr_b for reverse
+            (Direction::Forward, None) => (key.addr_a, key.port_a),
+            (Direction::Reverse, None) => (key.addr_b, key.port_b),
+        }
+    }
+
     fn both_fins(&self) -> bool {
         self.fin_seen[0] && self.fin_seen[1]
     }
@@ -226,6 +245,9 @@ pub struct StreamData {
     pub key: StreamKey,
     pub payload: Vec<u8>,
     pub direction: Direction,
+    /// Source address (IP, port) of the endpoint that sent this data.
+    /// Derived from the stream's initiator tracking, not the triggering packet.
+    pub src_addr: (IpAddr, u16),
 }
 
 impl StreamData {
@@ -269,17 +291,21 @@ impl StreamTable {
             if let Some(state) = self.streams.remove(&key) {
                 let mut results = Vec::new();
                 if let Some(p) = state.fwd.drain_all() {
+                    let src = state.src_addr_for(&key, Direction::Forward);
                     results.push(StreamData {
                         key: key.clone(),
                         payload: p,
                         direction: Direction::Forward,
+                        src_addr: src,
                     });
                 }
                 if let Some(p) = state.rev.drain_all() {
+                    let src = state.src_addr_for(&key, Direction::Reverse);
                     results.push(StreamData {
                         key,
                         payload: p,
                         direction: Direction::Reverse,
+                        src_addr: src,
                     });
                 }
                 return results;
@@ -293,21 +319,25 @@ impl StreamTable {
             // If a stream already exists for this key, emit its data first
             if let Some(old_state) = self.streams.remove(&key) {
                 if let Some(p) = old_state.fwd.drain_all() {
+                    let src = old_state.src_addr_for(&key, Direction::Forward);
                     results.push(StreamData {
                         key: key.clone(),
                         payload: p,
                         direction: Direction::Forward,
+                        src_addr: src,
                     });
                 }
                 if let Some(p) = old_state.rev.drain_all() {
+                    let src = old_state.src_addr_for(&key, Direction::Reverse);
                     results.push(StreamData {
                         key: key.clone(),
                         payload: p,
                         direction: Direction::Reverse,
+                        src_addr: src,
                     });
                 }
             }
-            self.evict_if_full();
+            results.extend(self.evict_if_full());
             let mut state = StreamState::new();
             state.last_active = self.tick;
             if let (Some(ip), Some(port)) = (packet.src_ip, packet.src_port) {
@@ -329,9 +359,11 @@ impl StreamTable {
         }
 
         // Evict least-recently-active stream if at capacity for a new stream
-        if !self.streams.contains_key(&key) {
-            self.evict_if_full();
-        }
+        let mut evicted = if !self.streams.contains_key(&key) {
+            self.evict_if_full()
+        } else {
+            vec![]
+        };
 
         let state = self
             .streams
@@ -394,6 +426,7 @@ impl StreamTable {
         let should_emit = flags.psh || flags.fin;
 
         if should_emit {
+            let src = state.src_addr_for(&key, dir);
             let buf = if is_fwd {
                 &mut state.fwd
             } else {
@@ -403,6 +436,7 @@ impl StreamTable {
                 key: key.clone(),
                 payload,
                 direction: dir,
+                src_addr: src,
             });
 
             // Remove stream only when both directions have FIN'd
@@ -410,12 +444,12 @@ impl StreamTable {
                 self.streams.remove(&key);
             }
 
-            match result {
-                Some(sd) => vec![sd],
-                None => vec![],
+            if let Some(sd) = result {
+                evicted.push(sd);
             }
+            evicted
         } else {
-            vec![]
+            evicted
         }
     }
 
@@ -431,9 +465,10 @@ impl StreamTable {
     /// Evict the least-recently-active stream if at capacity.
     /// M16: This is O(n) over all streams. Acceptable because max_streams
     /// defaults to 10,000 and eviction is rare (only when at capacity).
-    fn evict_if_full(&mut self) {
+    /// M6: Returns any unemitted data from the evicted stream instead of silently dropping it.
+    fn evict_if_full(&mut self) -> Vec<StreamData> {
         if self.streams.len() < self.max_streams {
-            return;
+            return vec![];
         }
         // Find the stream with the smallest last_active value
         let oldest_key = self
@@ -442,8 +477,30 @@ impl StreamTable {
             .min_by_key(|(_, state)| state.last_active)
             .map(|(key, _)| key.clone());
         if let Some(key) = oldest_key {
-            self.streams.remove(&key);
+            if let Some(state) = self.streams.remove(&key) {
+                let mut results = Vec::new();
+                if let Some(p) = state.fwd.drain_all() {
+                    let src = state.src_addr_for(&key, Direction::Forward);
+                    results.push(StreamData {
+                        key: key.clone(),
+                        payload: p,
+                        direction: Direction::Forward,
+                        src_addr: src,
+                    });
+                }
+                if let Some(p) = state.rev.drain_all() {
+                    let src = state.src_addr_for(&key, Direction::Reverse);
+                    results.push(StreamData {
+                        key,
+                        payload: p,
+                        direction: Direction::Reverse,
+                        src_addr: src,
+                    });
+                }
+                return results;
+            }
         }
+        vec![]
     }
 }
 
@@ -974,5 +1031,132 @@ mod tests {
         // Partial retransmit: seq 113 overlaps 2 bytes (next_seq=115), new data starts at "d"
         assert!(buf.append(113, b"rldNEW", 1024));
         assert_eq!(buf.payload, b"helloXXXXXworlddNEW");
+    }
+
+    #[test]
+    fn rst_from_responder_reports_correct_src_addrs() {
+        // Regression: RST from the server should still report Forward data
+        // as coming from the client and Reverse data from the server.
+        let mut table = StreamTable::new();
+
+        let client_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let server_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+        // Client SYN
+        let pkt = make_packet(1234, 80, 100, syn(), &[]);
+        table.process(&pkt);
+        // Server SYN-ACK
+        let pkt = make_reverse_packet(80, 1234, 200, syn_ack(), &[]);
+        table.process(&pkt);
+
+        // Client sends data (buffered, no PSH)
+        let pkt = make_packet(1234, 80, 101, ack_only(), b"client-data");
+        assert!(table.process(&pkt).is_empty());
+        // Server sends data (buffered, no PSH)
+        let pkt = make_reverse_packet(80, 1234, 201, ack_only(), b"server-data");
+        assert!(table.process(&pkt).is_empty());
+
+        // RST from the SERVER (not the client!) — should still emit correct src_addrs
+        let pkt = make_reverse_packet(80, 1234, 212, rst_flags(), &[]);
+        let results = table.process(&pkt);
+        assert_eq!(results.len(), 2);
+
+        // Forward data was from the client
+        assert_eq!(results[0].direction, Direction::Forward);
+        assert_eq!(results[0].src_addr, (client_ip, 1234));
+
+        // Reverse data was from the server
+        assert_eq!(results[1].direction, Direction::Reverse);
+        assert_eq!(results[1].src_addr, (server_ip, 80));
+    }
+
+    #[test]
+    fn psh_emit_has_correct_src_addr() {
+        let mut table = StreamTable::new();
+
+        let client_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let server_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+        let pkt = make_packet(1234, 80, 100, syn(), &[]);
+        table.process(&pkt);
+        let pkt = make_reverse_packet(80, 1234, 200, syn_ack(), &[]);
+        table.process(&pkt);
+
+        // Client PSH
+        let pkt = make_packet(1234, 80, 101, psh_ack(), b"request");
+        let data = process_one(&mut table, &pkt);
+        assert_eq!(data.src_addr, (client_ip, 1234));
+
+        // Server PSH
+        let pkt = make_reverse_packet(80, 1234, 201, psh_ack(), b"response");
+        let data = process_one(&mut table, &pkt);
+        assert_eq!(data.src_addr, (server_ip, 80));
+    }
+
+    #[test]
+    fn syn_reuse_emits_correct_src_addrs() {
+        // When a new SYN arrives on an existing stream, the old stream's
+        // data should have correct src_addrs from the OLD initiator.
+        let mut table = StreamTable::new();
+
+        let client_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let server_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+
+        // First connection
+        let pkt = make_packet(1234, 80, 100, syn(), &[]);
+        table.process(&pkt);
+        let pkt = make_reverse_packet(80, 1234, 200, syn_ack(), &[]);
+        table.process(&pkt);
+        // Both sides send data without PSH
+        let pkt = make_packet(1234, 80, 101, ack_only(), b"old-client");
+        table.process(&pkt);
+        let pkt = make_reverse_packet(80, 1234, 201, ack_only(), b"old-server");
+        table.process(&pkt);
+
+        // New SYN on same 4-tuple — emits old stream data
+        let pkt = make_packet(1234, 80, 500, syn(), &[]);
+        let results = table.process(&pkt);
+        assert_eq!(results.len(), 2);
+
+        assert_eq!(results[0].direction, Direction::Forward);
+        assert_eq!(results[0].src_addr, (client_ip, 1234));
+
+        assert_eq!(results[1].direction, Direction::Reverse);
+        assert_eq!(results[1].src_addr, (server_ip, 80));
+    }
+
+    #[test]
+    fn evict_drains_unemitted_data() {
+        // M6: When evicting a stream at capacity, unemitted data must be returned,
+        // not silently dropped.
+        let mut table = StreamTable::new();
+        table.max_streams = 2;
+
+        // Create stream A (port 1000) and buffer data without PSH
+        let pkt = make_packet(1000, 80, 100, syn(), &[]);
+        table.process(&pkt);
+        let pkt = make_reverse_packet(80, 1000, 200, syn_ack(), &[]);
+        table.process(&pkt);
+        let pkt = make_packet(1000, 80, 101, ack_only(), b"stream-a-data");
+        assert!(table.process(&pkt).is_empty()); // buffered, not emitted
+
+        // Create stream B (port 2000)
+        let pkt = make_packet(2000, 80, 100, syn(), &[]);
+        table.process(&pkt);
+
+        // Create stream C (port 3000) — triggers eviction of stream A (oldest)
+        let pkt = make_packet(3000, 80, 100, syn(), &[]);
+        let results = table.process(&pkt);
+
+        // The evicted stream's unemitted data should be returned
+        assert!(
+            !results.is_empty(),
+            "evicted stream data must not be silently dropped"
+        );
+        let evicted_payload: Vec<u8> = results
+            .iter()
+            .flat_map(|sd| sd.payload.iter().copied())
+            .collect();
+        assert_eq!(evicted_payload, b"stream-a-data");
     }
 }
