@@ -86,9 +86,14 @@ const KNOWN_METHODS: &[&str] = &[
 /// M11: Maximum chunked body size (10 MB).
 const MAX_CHUNKED_BODY: usize = 10 * 1024 * 1024;
 
+/// Maximum close-delimited response body size (1 MB).
+/// Independent of stream reassembly limits for defense in depth.
+const MAX_BODY_SIZE: usize = 1_048_576;
+
 /// H1: Find the start of the next HTTP message in a byte slice.
 /// Looks for request methods and "HTTP/" response starts.
-/// M7: Uses first-byte filtering to avoid O(n*m) scanning.
+/// M7: Uses first-byte filtering to reduce scanning — only bytes matching
+/// a method's first character trigger the inner starts_with comparisons.
 /// M6: Requires full "HTTP/x.y NNN" pattern for response starts to reduce
 /// false splits in close-delimited response bodies.
 fn find_next_http_start(data: &[u8]) -> Option<usize> {
@@ -217,8 +222,10 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
             )
         } else if is_response && !after_headers.is_empty() {
             // H1: Close-delimited response — scan for next HTTP message start
-            // before consuming all remaining data.
-            let body_len = find_next_http_start(after_headers).unwrap_or(after_headers.len());
+            // before consuming all remaining data, bounded by MAX_BODY_SIZE.
+            let body_len = find_next_http_start(after_headers)
+                .unwrap_or(after_headers.len())
+                .min(MAX_BODY_SIZE);
             (
                 String::from_utf8_lossy(&after_headers[..body_len]).into_owned(),
                 body_len,

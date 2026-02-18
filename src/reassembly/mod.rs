@@ -45,6 +45,10 @@ impl DirectionBuffer {
 
     /// Append new data, using the reorder buffer to handle out-of-order segments.
     /// Returns true if any new in-order bytes were added.
+    ///
+    /// Safety of `data.len() as u32` casts: individual TCP segments are bounded
+    /// by IP packet size (<=64 KB), well within u32 range. The max_stream_bytes
+    /// limit (256 KB default) provides an additional bound.
     fn append(&mut self, seq: u32, data: &[u8], max_bytes: usize) -> bool {
         if data.is_empty() {
             return false;
@@ -159,6 +163,11 @@ impl DirectionBuffer {
     }
 
     /// Return new bytes since last emission, if any.
+    ///
+    /// After draining, the payload buffer is cleared as a memory optimization.
+    /// This means `drain_all()` will only see data accumulated after the last
+    /// `drain_new()` call — which is correct since already-emitted data should
+    /// not be re-emitted on FIN/RST teardown.
     fn drain_new(&mut self) -> Option<Vec<u8>> {
         if self.payload.len() > self.emitted_offset {
             let new_data = self.payload[self.emitted_offset..].to_vec();
@@ -279,6 +288,11 @@ impl StreamTable {
             max_stream_bytes: 262_144, // 256 KB per stream per direction
             tick: 0,
         }
+    }
+
+    /// Check whether a stream is still tracked (not closed or evicted).
+    pub fn contains(&self, key: &StreamKey) -> bool {
+        self.streams.contains_key(key)
     }
 
     /// Process a TCP packet. Returns stream data when the stream has new payload
@@ -478,7 +492,7 @@ impl StreamTable {
     }
 
     /// M17: Remove streams that haven't been active for a long time.
-    /// Called periodically (every 10k ticks) to prevent memory leaks.
+    /// Called periodically (every 1k ticks) to prevent memory leaks.
     fn sweep_stale(&mut self) {
         const STALE_THRESHOLD: u64 = 100_000;
         let current_tick = self.tick;

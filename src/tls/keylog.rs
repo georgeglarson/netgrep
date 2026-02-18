@@ -33,7 +33,20 @@ impl Drop for KeyLog {
 }
 
 impl KeyLog {
+    /// Maximum keylog file size (50 MB) to prevent excessive memory allocation.
+    const MAX_KEYLOG_SIZE: u64 = 50 * 1024 * 1024;
+
     pub fn from_file(path: &Path) -> Result<Self> {
+        let meta = std::fs::metadata(path)
+            .context(format!("Failed to stat keylog: {}", path.display()))?;
+        if meta.len() > Self::MAX_KEYLOG_SIZE {
+            anyhow::bail!(
+                "Keylog file too large ({} bytes, max {}): {}",
+                meta.len(),
+                Self::MAX_KEYLOG_SIZE,
+                path.display()
+            );
+        }
         let contents = std::fs::read_to_string(path)
             .context(format!("Failed to read keylog: {}", path.display()))?;
         Self::parse(&contents)

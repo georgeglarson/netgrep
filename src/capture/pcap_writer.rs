@@ -27,7 +27,8 @@ impl<W: Write> PcapWriter<W> {
             .unwrap_or_default();
 
         // pcap format uses u32 for ts_sec (wraps after 2106-02-07).
-        // Truncation is inherent to the format; use wrapping cast.
+        // Truncation is inherent to the format. Pre-epoch timestamps
+        // produce Duration::default() (0) via unwrap_or_default() above.
         let ts_sec = duration.as_secs() as u32;
         let ts_usec = duration.subsec_micros();
         let len = u32::try_from(data.len()).unwrap_or(u32::MAX);

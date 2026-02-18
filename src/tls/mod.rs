@@ -172,10 +172,9 @@ impl TlsDecryptor {
         }
     }
 
-    /// Remove a connection's TLS state. Call on FIN/RST.
-    /// L4: Currently unused — intended for future integration where the
-    /// capture loop explicitly cleans up TLS state on connection close.
-    #[allow(dead_code)]
+    /// Remove a connection's TLS state, zeroizing key material.
+    /// Called when the stream table removes a stream (FIN/RST/eviction)
+    /// so sensitive key material doesn't linger until LRU eviction.
     pub fn remove_connection(&mut self, key: &StreamKey) {
         self.connections.remove(key);
     }
@@ -505,6 +504,11 @@ impl TlsDecryptor {
     }
 
     /// Try to decrypt a TLS 1.3 record, trying handshake keys first, then application keys.
+    ///
+    /// Flow: handshake keys are tried first. If they succeed, the result is returned
+    /// immediately (application data or None for non-0x17 content types like Finished).
+    /// Application keys are only tried if handshake keys fail to decrypt the record.
+    /// Once application keys succeed, handshake keys are discarded for this connection.
     fn decrypt_tls13_record(
         &mut self,
         key: &StreamKey,
