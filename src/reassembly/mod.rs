@@ -208,10 +208,15 @@ impl DirectionBuffer {
     /// not be re-emitted on FIN/RST teardown.
     fn drain_new(&mut self) -> Option<Vec<u8>> {
         if self.payload.len() > self.emitted_offset {
-            let new_data = self.payload[self.emitted_offset..].to_vec();
-            // M13: Compact — all data has been emitted, clear the buffer to
-            // free memory instead of letting it grow unbounded.
-            self.payload.clear();
+            // L9: Use mem::take when the entire buffer is new (emitted_offset == 0)
+            // to avoid a redundant allocation+copy.
+            let new_data = if self.emitted_offset == 0 {
+                std::mem::take(&mut self.payload)
+            } else {
+                let data = self.payload[self.emitted_offset..].to_vec();
+                self.payload.clear();
+                data
+            };
             self.emitted_offset = 0;
             self.truncated = false;
             Some(new_data)
@@ -342,16 +347,19 @@ impl StreamTable {
 
         // M17: Periodically sweep stale streams to prevent memory leaks
         // from connections that never close cleanly.
-        if self.tick.is_multiple_of(1_000) {
-            self.sweep_stale();
-        }
+        // L12: Sweep returns unemitted data from stale streams.
+        let mut stale_data = if self.tick.is_multiple_of(1_000) {
+            self.sweep_stale()
+        } else {
+            vec![]
+        };
         let key = match packet.stream_key() {
             Some(k) => k,
-            None => return vec![],
+            None => return stale_data,
         };
         let flags = match packet.tcp_flags {
             Some(f) => f,
-            None => return vec![],
+            None => return stale_data,
         };
 
         // RST — tear down and emit any unemitted data from both directions
@@ -376,9 +384,10 @@ impl StreamTable {
                         src_addr: src,
                     });
                 }
-                return results;
+                stale_data.extend(results);
+                return stale_data;
             }
-            return vec![];
+            return stale_data;
         }
 
         // SYN without ACK — new connection (emit old stream data if key exists)
@@ -414,16 +423,22 @@ impl StreamTable {
             // SYN consumes one sequence number
             state.fwd.next_seq = packet.seq.map(|s| s.wrapping_add(1));
             self.streams.insert(key, state);
-            return results;
+            stale_data.extend(results);
+            return stale_data;
         }
 
-        // SYN+ACK — record responder's initial sequence number
+        // SYN+ACK — record responder's initial sequence number.
+        // Check direction to handle TCP simultaneous open (both sides SYN).
         if flags.syn && flags.ack {
             if let Some(state) = self.streams.get_mut(&key) {
                 state.last_active = self.tick;
-                state.rev.next_seq = packet.seq.map(|s| s.wrapping_add(1));
+                if state.is_forward(packet) {
+                    state.fwd.next_seq = packet.seq.map(|s| s.wrapping_add(1));
+                } else {
+                    state.rev.next_seq = packet.seq.map(|s| s.wrapping_add(1));
+                }
             }
-            return vec![];
+            return stale_data;
         }
 
         // Evict least-recently-active stream if at capacity for a new stream
@@ -546,19 +561,46 @@ impl StreamTable {
                     });
                 }
             }
-            evicted
+            stale_data.extend(evicted);
+            stale_data
         } else {
-            evicted
+            stale_data.extend(evicted);
+            stale_data
         }
     }
 
     /// M17: Remove streams that haven't been active for a long time.
     /// Called periodically (every 1k ticks) to prevent memory leaks.
-    fn sweep_stale(&mut self) {
+    /// L12: Returns any unemitted data from evicted streams instead of silently dropping it.
+    fn sweep_stale(&mut self) -> Vec<StreamData> {
         const STALE_THRESHOLD: u64 = 100_000;
         let current_tick = self.tick;
-        self.streams
-            .retain(|_, state| current_tick.saturating_sub(state.last_active) < STALE_THRESHOLD);
+        let mut evicted = Vec::new();
+        self.streams.retain(|key, state| {
+            if current_tick.saturating_sub(state.last_active) < STALE_THRESHOLD {
+                return true;
+            }
+            if let Some(p) = state.fwd.drain_all() {
+                let src = state.src_addr_for(key, Direction::Forward);
+                evicted.push(StreamData {
+                    key: key.clone(),
+                    payload: p,
+                    direction: Direction::Forward,
+                    src_addr: src,
+                });
+            }
+            if let Some(p) = state.rev.drain_all() {
+                let src = state.src_addr_for(key, Direction::Reverse);
+                evicted.push(StreamData {
+                    key: key.clone(),
+                    payload: p,
+                    direction: Direction::Reverse,
+                    src_addr: src,
+                });
+            }
+            false
+        });
+        evicted
     }
 
     /// Evict the least-recently-active stream if at capacity.

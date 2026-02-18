@@ -98,6 +98,13 @@ impl Drop for TlsConnection {
         self.decrypted.zeroize();
         self.handshake_buf_client.zeroize();
         self.handshake_buf_server.zeroize();
+        // L4: Zeroize client_random/server_random (used to look up master secrets)
+        if let Some(ref mut cr) = self.client_random {
+            cr.zeroize();
+        }
+        if let Some(ref mut sr) = self.server_random {
+            sr.zeroize();
+        }
     }
 }
 

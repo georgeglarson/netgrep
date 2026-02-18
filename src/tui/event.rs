@@ -12,12 +12,25 @@ pub struct CaptureEvent {
     pub detail: DetailContent,
 }
 
+impl CaptureEvent {
+    /// L19: Approximate heap size including both RowSummary and DetailContent.
+    pub fn approx_bytes(&self) -> usize {
+        self.summary.approx_bytes() + self.detail.approx_bytes()
+    }
+}
+
 /// Summary columns for one row in the TUI packet table.
 pub struct RowSummary {
     pub proto: String,
     pub src: String,
     pub dst: String,
     pub info: String,
+}
+
+impl RowSummary {
+    fn approx_bytes(&self) -> usize {
+        self.proto.len() + self.src.len() + self.dst.len() + self.info.len()
+    }
 }
 
 /// Content shown in the TUI detail pane when a row is selected.

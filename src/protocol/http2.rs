@@ -270,7 +270,17 @@ impl H2Tracker {
                     let end_stream = flags & FLAG_END_STREAM != 0;
                     let end_headers = flags & FLAG_END_HEADERS != 0;
 
+                    // L18: HEADERS on stream 0 is a protocol error, but we must
+                    // still decode HPACK to keep the dynamic table consistent.
                     if stream_id == 0 {
+                        if end_headers {
+                            let header_block = parse_headers_payload(&frame_payload, flags);
+                            let decoder = match direction {
+                                H2Direction::ClientToServer => &mut conn.client_decoder,
+                                H2Direction::ServerToClient => &mut conn.server_decoder,
+                            };
+                            let _ = decoder.decode(header_block);
+                        }
                         continue;
                     }
 

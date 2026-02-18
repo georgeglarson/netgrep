@@ -170,17 +170,19 @@ impl Formatter {
     }
 
     fn print_dns_text(&self, packet: &ParsedPacket, info: &DnsInfo, pattern: &Option<Regex>) {
+        // L17: format_dns_text now sanitizes DNS data internally
         let (_header, body) = self.format_dns_text(packet, info, pattern);
         if !self.quiet {
             let src = format_addr(packet.src_ip, packet.src_port);
             let dst = format_addr(packet.dst_ip, packet.dst_port);
 
             if info.is_response {
-                let qname = info
-                    .questions
-                    .first()
-                    .map(|q| q.name.as_str())
-                    .unwrap_or("?");
+                let qname = crate::sanitize::sanitize_control_chars(
+                    info.questions
+                        .first()
+                        .map(|q| q.name.as_str())
+                        .unwrap_or("?"),
+                );
                 let qtype = info
                     .questions
                     .first()
@@ -199,11 +201,12 @@ impl Formatter {
                     rcode.yellow()
                 );
             } else {
-                let qname = info
-                    .questions
-                    .first()
-                    .map(|q| q.name.as_str())
-                    .unwrap_or("?");
+                let qname = crate::sanitize::sanitize_control_chars(
+                    info.questions
+                        .first()
+                        .map(|q| q.name.as_str())
+                        .unwrap_or("?"),
+                );
                 let qtype = info
                     .questions
                     .first()
@@ -221,9 +224,6 @@ impl Formatter {
                 );
             }
         }
-        // L12: DNS body is built from structured fields (not raw payload), so it
-        // doesn't go through format_highlighted. Sanitize here before printing.
-        let body = crate::sanitize::sanitize_control_chars(&body);
         for line in body.lines() {
             print_highlighted_colored(line, pattern);
         }
@@ -319,12 +319,16 @@ impl Formatter {
     }
 
     /// Format DNS header and body text (no ANSI colors).
+    /// L17: Sanitizes control characters in DNS data fields (qname, rdata)
+    /// to prevent terminal escape injection from crafted DNS responses.
     pub fn format_dns_text(
         &self,
         packet: &ParsedPacket,
         info: &DnsInfo,
         _pattern: &Option<Regex>,
     ) -> (String, String) {
+        use crate::sanitize::sanitize_control_chars;
+
         let src = format_addr(packet.src_ip, packet.src_port);
         let dst = format_addr(packet.dst_ip, packet.dst_port);
 
@@ -332,8 +336,8 @@ impl Formatter {
             let qname = info
                 .questions
                 .first()
-                .map(|q| q.name.as_str())
-                .unwrap_or("?");
+                .map(|q| sanitize_control_chars(&q.name))
+                .unwrap_or_else(|| "?".into());
             let qtype = info
                 .questions
                 .first()
@@ -345,8 +349,8 @@ impl Formatter {
             let qname = info
                 .questions
                 .first()
-                .map(|q| q.name.as_str())
-                .unwrap_or("?");
+                .map(|q| sanitize_control_chars(&q.name))
+                .unwrap_or_else(|| "?".into());
             let qtype = info
                 .questions
                 .first()
@@ -358,15 +362,18 @@ impl Formatter {
         let mut body = String::new();
         if info.is_response {
             for r in &info.answers {
-                let line = format!("  {:<6}{:<40} TTL={}\n", r.rtype, r.rdata, r.ttl);
+                let rdata = sanitize_control_chars(&r.rdata);
+                let line = format!("  {:<6}{:<40} TTL={}\n", r.rtype, rdata, r.ttl);
                 body.push_str(&line);
             }
             for r in &info.authorities {
-                let line = format!("  {:<6}{:<40} TTL={} (auth)\n", r.rtype, r.rdata, r.ttl);
+                let rdata = sanitize_control_chars(&r.rdata);
+                let line = format!("  {:<6}{:<40} TTL={} (auth)\n", r.rtype, rdata, r.ttl);
                 body.push_str(&line);
             }
             for r in &info.additionals {
-                let line = format!("  {:<6}{:<40} TTL={} (add)\n", r.rtype, r.rdata, r.ttl);
+                let rdata = sanitize_control_chars(&r.rdata);
+                let line = format!("  {:<6}{:<40} TTL={} (add)\n", r.rtype, rdata, r.ttl);
                 body.push_str(&line);
             }
         }

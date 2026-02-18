@@ -115,6 +115,7 @@ fn find_next_http_start(data: &[u8]) -> Option<usize> {
     // Map each method's first byte to the methods starting with that byte,
     // so we only check relevant methods per byte (avoids quadratic scan).
     const METHOD_G: &[&str] = &["GET"];
+    const METHOD_H: &[&str] = &["HEAD"];
     const METHOD_P: &[&str] = &["POST", "PUT", "PATCH"];
     const METHOD_D: &[&str] = &["DELETE"];
     const METHOD_C: &[&str] = &["CONNECT"];
@@ -125,6 +126,10 @@ fn find_next_http_start(data: &[u8]) -> Option<usize> {
         let remaining = &data[i..];
         match remaining[0] {
             b'H' => {
+                // L15: Check HEAD method before HTTP/ response pattern
+                if check_methods(remaining, METHOD_H) {
+                    return Some(i);
+                }
                 // M6: Require "HTTP/" followed by digit.digit space digit
                 if remaining.len() >= 10
                     && remaining.starts_with(b"HTTP/")
@@ -237,6 +242,8 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
         };
 
         // M9: Unfold continuation headers (lines starting with SP/HTAB)
+        // L16: Cap number of headers to prevent resource exhaustion from crafted inputs.
+        const MAX_HEADERS: usize = 200;
         let mut headers: Vec<(String, String)> = Vec::new();
         for line in lines {
             if (line.starts_with(' ') || line.starts_with('\t')) && !headers.is_empty() {
@@ -246,6 +253,9 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
                     last.1.push_str(line.trim());
                 }
             } else if let Some((key, value)) = line.split_once(':') {
+                if headers.len() >= MAX_HEADERS {
+                    break;
+                }
                 headers.push((key.trim().to_string(), value.trim().to_string()));
             }
         }

@@ -26,8 +26,14 @@ pub struct Tls13Secrets {
 
 impl Drop for KeyLog {
     fn drop(&mut self) {
-        for secret in self.master_secrets.values_mut() {
+        // L14: Drain both maps so keys (client_random) are also zeroized.
+        // Tls13Secrets has #[zeroize(drop)] so values are handled automatically.
+        for (mut key, mut secret) in self.master_secrets.drain() {
+            key.zeroize();
             secret.zeroize();
+        }
+        for (mut key, _secrets) in self.tls13_secrets.drain() {
+            key.zeroize();
         }
     }
 }
