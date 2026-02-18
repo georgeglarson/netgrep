@@ -37,21 +37,29 @@ impl KeyLog {
     const MAX_KEYLOG_SIZE: u64 = 50 * 1024 * 1024;
 
     pub fn from_file(path: &Path) -> Result<Self> {
-        let meta = std::fs::metadata(path)
-            .context(format!("Failed to stat keylog: {}", path.display()))?;
-        if meta.len() > Self::MAX_KEYLOG_SIZE {
+        // Read first, then check size to avoid TOCTOU race between metadata() and read().
+        let mut raw =
+            std::fs::read(path).context(format!("Failed to read keylog: {}", path.display()))?;
+        if raw.len() as u64 > Self::MAX_KEYLOG_SIZE {
+            raw.zeroize();
             anyhow::bail!(
                 "Keylog file too large ({} bytes, max {}): {}",
-                meta.len(),
+                raw.len(),
                 Self::MAX_KEYLOG_SIZE,
                 path.display()
             );
         }
-        // M9: Read into a Vec<u8> so we can zeroize after parsing.
-        let mut raw =
-            std::fs::read(path).context(format!("Failed to read keylog: {}", path.display()))?;
-        let contents = String::from_utf8_lossy(&raw);
-        let result = Self::parse(&contents);
+        // Use from_utf8 (not from_utf8_lossy) to avoid creating a separate
+        // owned String that would leak secret material without zeroization.
+        // Keylog files are ASCII text, so non-UTF-8 content is an error.
+        let contents = match std::str::from_utf8(&raw) {
+            Ok(s) => s,
+            Err(_) => {
+                raw.zeroize();
+                anyhow::bail!("Keylog file is not valid UTF-8: {}", path.display());
+            }
+        };
+        let result = Self::parse(contents);
         raw.zeroize();
         result
     }

@@ -289,9 +289,10 @@ impl H2Tracker {
                                 H2Direction::ServerToClient => &mut conn.server_decoder,
                             };
                             let _ = decoder.decode(header_block);
-                        } else {
+                        } else if conn.discard_header_bufs.len() < MAX_STREAMS_PER_CONN {
                             // No END_HEADERS — accumulate fragments for HPACK
                             // decode when the final CONTINUATION arrives.
+                            // Cap discard_header_bufs to prevent memory exhaustion.
                             let mut buf = Vec::new();
                             if header_block.len() <= MAX_HEADER_BLOCK {
                                 buf.extend_from_slice(header_block);
@@ -385,14 +386,9 @@ impl H2Tracker {
                             }
                             continue;
                         }
-                        // Standalone CONTINUATION without a tracked discard buffer
-                        if end_headers {
-                            let decoder = match direction {
-                                H2Direction::ClientToServer => &mut conn.client_decoder,
-                                H2Direction::ServerToClient => &mut conn.server_decoder,
-                            };
-                            let _ = decoder.decode(&frame_payload);
-                        }
+                        // Orphaned CONTINUATION without a preceding HEADERS/
+                        // PUSH_PROMISE — skip decoding. Feeding arbitrary data
+                        // to the HPACK decoder could corrupt the dynamic table.
                     }
                 }
                 FRAME_DATA => {
@@ -463,9 +459,10 @@ impl H2Tracker {
                             H2Direction::ServerToClient => &mut conn.server_decoder,
                         };
                         let _ = decoder.decode(header_block);
-                    } else {
+                    } else if conn.discard_header_bufs.len() < MAX_STREAMS_PER_CONN {
                         // No END_HEADERS — accumulate fragments for HPACK
                         // decode when the final CONTINUATION arrives.
+                        // Cap discard_header_bufs to prevent memory exhaustion.
                         let mut buf = Vec::new();
                         if header_block.len() <= MAX_HEADER_BLOCK {
                             buf.extend_from_slice(header_block);

@@ -31,6 +31,10 @@ struct DirectionBuffer {
     reorder_buf: HashMap<u32, Vec<u8>>,
     /// Byte offset up to which we've already emitted data.
     emitted_offset: usize,
+    /// Set when the byte limit truncates incoming data. Once set, sequence
+    /// numbers continue to be tracked but no more data is stored, preventing
+    /// corrupted gaps in the reassembled stream.
+    truncated: bool,
 }
 
 impl DirectionBuffer {
@@ -40,6 +44,7 @@ impl DirectionBuffer {
             next_seq: None,
             reorder_buf: HashMap::new(),
             emitted_offset: 0,
+            truncated: false,
         }
     }
 
@@ -54,12 +59,28 @@ impl DirectionBuffer {
             return false;
         }
 
+        // Once truncated, track sequence numbers but don't store data.
+        // This prevents corrupted gaps in the reassembled stream when
+        // the byte limit is hit mid-segment.
+        if self.truncated {
+            if let Some(expected) = self.next_seq {
+                let end = seq.wrapping_add(data.len() as u32);
+                if seq_after(end, expected) {
+                    self.next_seq = Some(end);
+                }
+            }
+            return false;
+        }
+
         match self.next_seq {
             None => {
                 // First data for this direction
                 let to_copy = data.len().min(max_bytes.saturating_sub(self.payload.len()));
                 if to_copy > 0 {
                     self.payload.extend_from_slice(&data[..to_copy]);
+                }
+                if to_copy < data.len() {
+                    self.truncated = true;
                 }
                 self.next_seq = Some(seq.wrapping_add(data.len() as u32));
                 true
@@ -72,6 +93,9 @@ impl DirectionBuffer {
                     let to_copy = data.len().min(max_bytes.saturating_sub(self.payload.len()));
                     if to_copy > 0 {
                         self.payload.extend_from_slice(&data[..to_copy]);
+                    }
+                    if to_copy < data.len() {
+                        self.truncated = true;
                     }
                     self.next_seq = Some(seq.wrapping_add(data.len() as u32));
                     // Flush any buffered segments that are now in order
@@ -87,8 +111,10 @@ impl DirectionBuffer {
                     }
                     false
                 } else {
-                    // Overlap/retransmission
-                    let overlap = (-diff) as usize;
+                    // Overlap/retransmission — compute overlap via wrapping
+                    // subtraction instead of negating diff, which panics when
+                    // diff == i32::MIN (seq exactly 2^31 behind expected).
+                    let overlap = expected.wrapping_sub(seq) as usize;
                     if overlap < data.len() {
                         let new_data = &data[overlap..];
                         let to_copy = new_data
@@ -96,6 +122,9 @@ impl DirectionBuffer {
                             .min(max_bytes.saturating_sub(self.payload.len()));
                         if to_copy > 0 {
                             self.payload.extend_from_slice(&new_data[..to_copy]);
+                        }
+                        if to_copy < new_data.len() {
+                            self.truncated = true;
                         }
                         let end = seq.wrapping_add(data.len() as u32);
                         if seq_after(end, expected) {
@@ -119,11 +148,16 @@ impl DirectionBuffer {
             // Try direct lookup first — exact key lookup works correctly
             // regardless of sequence number wrapping.
             if let Some(seg_data) = self.reorder_buf.remove(&expected) {
-                let to_copy = seg_data
-                    .len()
-                    .min(max_bytes.saturating_sub(self.payload.len()));
-                if to_copy > 0 {
-                    self.payload.extend_from_slice(&seg_data[..to_copy]);
+                if !self.truncated {
+                    let to_copy = seg_data
+                        .len()
+                        .min(max_bytes.saturating_sub(self.payload.len()));
+                    if to_copy > 0 {
+                        self.payload.extend_from_slice(&seg_data[..to_copy]);
+                    }
+                    if to_copy < seg_data.len() {
+                        self.truncated = true;
+                    }
                 }
                 self.next_seq = Some(expected.wrapping_add(seg_data.len() as u32));
                 continue;
@@ -140,15 +174,19 @@ impl DirectionBuffer {
             match overlapping {
                 Some(seg_seq) => {
                     let seg_data = self.reorder_buf.remove(&seg_seq).unwrap();
-                    let diff = seg_seq.wrapping_sub(expected) as i32;
-                    let overlap = (-diff) as usize;
+                    let overlap = expected.wrapping_sub(seg_seq) as usize;
                     if overlap < seg_data.len() {
-                        let new_data = &seg_data[overlap..];
-                        let to_copy = new_data
-                            .len()
-                            .min(max_bytes.saturating_sub(self.payload.len()));
-                        if to_copy > 0 {
-                            self.payload.extend_from_slice(&new_data[..to_copy]);
+                        if !self.truncated {
+                            let new_data = &seg_data[overlap..];
+                            let to_copy = new_data
+                                .len()
+                                .min(max_bytes.saturating_sub(self.payload.len()));
+                            if to_copy > 0 {
+                                self.payload.extend_from_slice(&new_data[..to_copy]);
+                            }
+                            if to_copy < new_data.len() {
+                                self.truncated = true;
+                            }
                         }
                         let end = seg_seq.wrapping_add(seg_data.len() as u32);
                         if seq_after(end, expected) {
@@ -175,6 +213,7 @@ impl DirectionBuffer {
             // free memory instead of letting it grow unbounded.
             self.payload.clear();
             self.emitted_offset = 0;
+            self.truncated = false;
             Some(new_data)
         } else {
             None
@@ -429,8 +468,11 @@ impl StreamTable {
             let effective_total = buf.total_bytes() + reorder_bytes;
 
             if effective_total < max {
+                // Subtract reorder buffer bytes from max so in-order
+                // appends don't overshoot the per-direction limit.
+                let effective_max = max.saturating_sub(reorder_bytes);
                 if let Some(seq) = packet.seq {
-                    buf.append(seq, &packet.payload, max);
+                    buf.append(seq, &packet.payload, effective_max);
                 } else {
                     // No sequence number (shouldn't happen for TCP) — append raw
                     let remaining = max.saturating_sub(buf.payload.len());
@@ -464,26 +506,45 @@ impl StreamTable {
         let should_emit = flags.psh || flags.fin;
 
         if should_emit {
-            let src = state.src_addr_for(&key, dir);
-            let buf = if is_fwd {
-                &mut state.fwd
-            } else {
-                &mut state.rev
-            };
-            let result = buf.drain_new().map(|payload| StreamData {
-                key: key.clone(),
-                payload,
-                direction: dir,
-                src_addr: src,
-            });
-
-            // Remove stream only when both directions have FIN'd
+            // When both FINs have been seen, drain both directions before
+            // removing the stream — matching the RST teardown path so that
+            // buffered data from the opposite direction is not silently lost.
             if state.both_fins() {
-                self.streams.remove(&key);
-            }
-
-            if let Some(sd) = result {
-                evicted.push(sd);
+                if let Some(state) = self.streams.remove(&key) {
+                    if let Some(p) = state.fwd.drain_all() {
+                        let src = state.src_addr_for(&key, Direction::Forward);
+                        evicted.push(StreamData {
+                            key: key.clone(),
+                            payload: p,
+                            direction: Direction::Forward,
+                            src_addr: src,
+                        });
+                    }
+                    if let Some(p) = state.rev.drain_all() {
+                        let src = state.src_addr_for(&key, Direction::Reverse);
+                        evicted.push(StreamData {
+                            key,
+                            payload: p,
+                            direction: Direction::Reverse,
+                            src_addr: src,
+                        });
+                    }
+                }
+            } else {
+                let src = state.src_addr_for(&key, dir);
+                let buf = if is_fwd {
+                    &mut state.fwd
+                } else {
+                    &mut state.rev
+                };
+                if let Some(payload) = buf.drain_new() {
+                    evicted.push(StreamData {
+                        key,
+                        payload,
+                        direction: dir,
+                        src_addr: src,
+                    });
+                }
             }
             evicted
         } else {
@@ -1161,6 +1222,35 @@ mod tests {
 
         assert_eq!(results[1].direction, Direction::Reverse);
         assert_eq!(results[1].src_addr, (server_ip, 80));
+    }
+
+    #[test]
+    fn truncation_prevents_gap_in_reassembled_data() {
+        let mut buf = DirectionBuffer::new();
+        // Fill to near the limit (8 of 10 bytes)
+        assert!(buf.append(100, &[0xAA; 8], 10));
+        assert_eq!(buf.payload.len(), 8);
+        assert!(!buf.truncated);
+
+        // This segment partially fits (only 2 of 5 bytes), triggers truncation
+        assert!(buf.append(108, &[0xBB; 5], 10));
+        assert_eq!(buf.payload.len(), 10);
+        assert_eq!(&buf.payload[..8], &[0xAA; 8]);
+        assert_eq!(&buf.payload[8..10], &[0xBB; 2]);
+        assert!(buf.truncated);
+
+        // Further data is silently dropped (no gap created)
+        assert!(!buf.append(113, &[0xCC; 5], 10));
+        assert_eq!(buf.payload.len(), 10); // unchanged
+        // But next_seq still advances to track TCP position
+        assert_eq!(buf.next_seq, Some(118));
+
+        // After drain, truncated is reset and stream can continue
+        let drained = buf.drain_new().unwrap();
+        assert_eq!(drained.len(), 10);
+        assert!(!buf.truncated);
+        assert!(buf.append(118, &[0xDD; 3], 10));
+        assert_eq!(buf.payload, &[0xDD; 3]);
     }
 
     #[test]

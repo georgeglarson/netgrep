@@ -77,8 +77,13 @@ impl DirectionKeys {
         }
         let mut nonce = [0u8; 12];
         nonce[..4].copy_from_slice(&self.iv[..4]);
-        let copy_len = explicit_nonce.len().min(8);
-        nonce[4..4 + copy_len].copy_from_slice(&explicit_nonce[..copy_len]);
+        if explicit_nonce.len() != 8 {
+            return Err(anyhow::anyhow!(
+                "TLS 1.2 explicit nonce must be exactly 8 bytes, got {}",
+                explicit_nonce.len()
+            ));
+        }
+        nonce[4..12].copy_from_slice(explicit_nonce);
 
         let nonce = aead::Nonce::try_assume_unique_for_key(&nonce)
             .map_err(|_| anyhow::anyhow!("Invalid nonce"))?;
@@ -388,6 +393,21 @@ mod tests {
                 .to_string()
                 .contains("sequence number overflow")
         );
+    }
+
+    #[test]
+    fn tls12_explicit_nonce_wrong_length_returns_error() {
+        let mut keys = make_keys([0u8; 12]);
+        let mut ct = vec![0u8; 32];
+        // Too short
+        let result = keys.decrypt_tls12_record(&mut ct, &[0u8; 13], &[0u8; 7]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exactly 8 bytes"));
+        // Too long
+        let mut ct2 = vec![0u8; 32];
+        let result = keys.decrypt_tls12_record(&mut ct2, &[0u8; 13], &[0u8; 9]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("exactly 8 bytes"));
     }
 
     #[test]

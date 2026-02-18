@@ -149,27 +149,26 @@ impl TlsDecryptor {
         conn.last_active = self.tick;
         let from_client = conn.is_from_client(src_ip, src_port);
 
-        // Check buffer size before extending to avoid temporary memory spike
+        // Check buffer size before extending. On overflow, remove the entire
+        // connection — just clearing the buffer would leave the parser at a
+        // mid-record position, causing all subsequent parsing to fail.
+        let overflow = if from_client {
+            conn.from_client_buf.len() + payload.len() > MAX_BUFFER_BYTES
+        } else {
+            conn.from_server_buf.len() + payload.len() > MAX_BUFFER_BYTES
+        };
+        if overflow {
+            eprintln!(
+                "Warning: TLS {} buffer overflow for {:?}, removing connection",
+                if from_client { "client" } else { "server" },
+                key
+            );
+            self.connections.remove(key);
+            return;
+        }
         if from_client {
-            if conn.from_client_buf.len() + payload.len() > MAX_BUFFER_BYTES {
-                // L22: Warn when buffer is cleared on overflow
-                eprintln!(
-                    "Warning: TLS client buffer overflow for {:?}, clearing",
-                    key
-                );
-                conn.from_client_buf.clear();
-                return;
-            }
             conn.from_client_buf.extend_from_slice(payload);
         } else {
-            if conn.from_server_buf.len() + payload.len() > MAX_BUFFER_BYTES {
-                eprintln!(
-                    "Warning: TLS server buffer overflow for {:?}, clearing",
-                    key
-                );
-                conn.from_server_buf.clear();
-                return;
-            }
             conn.from_server_buf.extend_from_slice(payload);
         }
 
@@ -339,49 +338,59 @@ impl TlsDecryptor {
         src_ip: IpAddr,
         src_port: u16,
     ) {
-        // Append data to the direction's handshake buffer and check for completeness.
-        // We extract the complete message (if any) while holding the borrow, then
-        // release it before calling process_handshake (which needs &mut self).
-        let complete_msg = {
+        // Append data to the direction's handshake buffer, then extract all
+        // complete messages (a single TLS record can contain multiple handshake
+        // messages). We extract one message per iteration while holding the
+        // borrow, release it to call process_handshake, then re-acquire.
+        {
             let conn = match self.connections.get_mut(key) {
                 Some(c) => c,
                 None => return,
             };
-
             let buf = if from_client {
                 &mut conn.handshake_buf_client
             } else {
                 &mut conn.handshake_buf_server
             };
-
-            // Check size limit before appending
             if buf.len() + data.len() > MAX_HANDSHAKE_BUF {
                 buf.clear();
                 return;
             }
-
             buf.extend_from_slice(data);
+        }
 
-            // Need at least 4 bytes for a handshake header: type(1) + length(3)
-            if buf.len() < 4 {
-                return;
-            }
+        loop {
+            let complete_msg = {
+                let conn = match self.connections.get_mut(key) {
+                    Some(c) => c,
+                    None => return,
+                };
+                let buf = if from_client {
+                    &mut conn.handshake_buf_client
+                } else {
+                    &mut conn.handshake_buf_server
+                };
 
-            // Parse handshake message length
-            let msg_len = ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | (buf[3] as usize);
-            let total_len = 4 + msg_len;
+                // Need at least 4 bytes for a handshake header: type(1) + length(3)
+                if buf.len() < 4 {
+                    break;
+                }
 
-            if buf.len() < total_len {
-                return; // Incomplete — wait for more records
-            }
+                let msg_len =
+                    ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | (buf[3] as usize);
+                let total_len = 4 + msg_len;
 
-            // Extract the complete message and drain the buffer
-            let msg = buf[..total_len].to_vec();
-            buf.drain(..total_len);
-            msg
-        };
+                if buf.len() < total_len {
+                    break; // Incomplete — wait for more records
+                }
 
-        self.process_handshake(key, &complete_msg, src_ip, src_port);
+                let msg = buf[..total_len].to_vec();
+                buf.drain(..total_len);
+                msg
+            };
+
+            self.process_handshake(key, &complete_msg, src_ip, src_port);
+        }
     }
 
     fn process_handshake(&mut self, key: &StreamKey, data: &[u8], src_ip: IpAddr, src_port: u16) {
@@ -621,20 +630,23 @@ impl TlsDecryptor {
             };
             if let Some(keys) = hs_keys {
                 let mut ct = record.data.to_vec();
-                if let Ok(plaintext) = keys.decrypt_record(&mut ct, &aad)
+                let decrypt_result = keys.decrypt_record(&mut ct, &aad);
+                ct.zeroize(); // Zeroize in-place decrypted plaintext
+                if let Ok(plaintext) = decrypt_result
                     && let Some((data, content_type)) = Self::strip_tls13_content_type(plaintext)
                 {
                     if content_type == 0x17 {
                         return Some(data);
                     }
-                    // M7: Detect KeyUpdate (handshake type 24) — discard keys
-                    if content_type == 0x16 && data.first() == Some(&24) {
-                        eprintln!(
-                            "Warning: TLS 1.3 KeyUpdate detected; discarding keys for this direction"
-                        );
+                    // Detect Finished (handshake type 20) — mark handshake complete.
+                    // After Finished, this direction switches to application keys,
+                    // preventing sequence counter desync from the dual-try fallback.
+                    if content_type == 0x16 && data.first() == Some(&20) {
                         if is_from_client {
+                            conn.client_hs_complete = true;
                             conn.client_hs_keys = None;
                         } else {
+                            conn.server_hs_complete = true;
                             conn.server_hs_keys = None;
                         }
                     }
@@ -651,21 +663,24 @@ impl TlsDecryptor {
         };
         if let Some(keys) = app_keys {
             let mut ct = record.data.to_vec();
-            if let Ok(plaintext) = keys.decrypt_record(&mut ct, &aad)
+            let decrypt_result = keys.decrypt_record(&mut ct, &aad);
+            ct.zeroize(); // Zeroize in-place decrypted plaintext
+            if let Ok(plaintext) = decrypt_result
                 && let Some((data, content_type)) = Self::strip_tls13_content_type(plaintext)
             {
-                if content_type == 0x17 {
-                    // M10: Mark handshake as complete for this direction.
-                    // Discard handshake keys to avoid dual-try on subsequent records.
-                    if !hs_complete {
-                        if is_from_client {
-                            conn.client_hs_complete = true;
-                            conn.client_hs_keys = None;
-                        } else {
-                            conn.server_hs_complete = true;
-                            conn.server_hs_keys = None;
-                        }
+                // Mark handshake as complete for this direction on any
+                // successful app-key decryption (not just 0x17). This
+                // prevents sequence counter desync from the dual-try fallback.
+                if !hs_complete {
+                    if is_from_client {
+                        conn.client_hs_complete = true;
+                        conn.client_hs_keys = None;
+                    } else {
+                        conn.server_hs_complete = true;
+                        conn.server_hs_keys = None;
                     }
+                }
+                if content_type == 0x17 {
                     return Some(data);
                 }
                 // M7: Detect KeyUpdate (handshake type 24) — discard keys
@@ -742,8 +757,9 @@ impl TlsDecryptor {
                 pt_len_bytes[1],
             ];
 
-            keys.decrypt_tls12_record(&mut ciphertext, &aad, &explicit_nonce)
-                .ok()
+            let result = keys.decrypt_tls12_record(&mut ciphertext, &aad, &explicit_nonce);
+            ciphertext.zeroize(); // Zeroize in-place decrypted plaintext
+            result.ok()
         } else {
             // ChaCha20-Poly1305: no explicit nonce, 16-byte tag appended
             // Need at least 16 (tag) bytes
@@ -773,7 +789,9 @@ impl TlsDecryptor {
             ];
 
             // Use build_nonce (XOR seq with full 12-byte IV) via decrypt_record
-            keys.decrypt_record(&mut ciphertext, &aad).ok()
+            let result = keys.decrypt_record(&mut ciphertext, &aad);
+            ciphertext.zeroize(); // Zeroize in-place decrypted plaintext
+            result.ok()
         }
     }
 }
@@ -944,9 +962,9 @@ mod tests {
         assert_eq!(conn.iv_len, 4);
     }
 
-    // T12: Test MAX_BUFFER_BYTES enforcement — oversized payloads are rejected
+    // T12: Test MAX_BUFFER_BYTES enforcement — connection removed on overflow
     #[test]
-    fn max_buffer_bytes_clears_on_overflow() {
+    fn max_buffer_bytes_removes_on_overflow() {
         let keylog = KeyLog::default();
         let mut decryptor = TlsDecryptor::new(keylog);
         let src_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
@@ -961,12 +979,10 @@ mod tests {
         let conn = decryptor.connections.get_mut(&key).unwrap();
         conn.from_client_buf = vec![0xFF; MAX_BUFFER_BYTES - 10];
 
-        // Next packet should overflow and clear the buffer
+        // Next packet should overflow and remove the connection entirely
         let big_payload = vec![0xAA; 100];
         decryptor.process_packet(&key, &big_payload, src_ip, 12345);
-        let conn = decryptor.connections.get(&key).unwrap();
-        // Buffer was cleared on overflow
-        assert!(conn.from_client_buf.len() < MAX_BUFFER_BYTES);
+        assert!(!decryptor.connections.contains_key(&key));
     }
 
     // T12b: Server direction buffer also enforced
@@ -984,10 +1000,9 @@ mod tests {
         conn.client_addr = Some((client_ip, 12345));
         conn.from_server_buf = vec![0xFF; MAX_BUFFER_BYTES - 5];
 
-        // Server packet should overflow
+        // Server packet should overflow and remove the connection
         let big_payload = vec![0xBB; 50];
         decryptor.process_packet(&key, &big_payload, server_ip, 443);
-        let conn = decryptor.connections.get(&key).unwrap();
-        assert!(conn.from_server_buf.len() < MAX_BUFFER_BYTES);
+        assert!(!decryptor.connections.contains_key(&key));
     }
 }
