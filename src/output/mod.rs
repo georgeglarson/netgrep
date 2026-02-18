@@ -451,10 +451,10 @@ pub fn format_hex(data: &[u8]) -> String {
     let data = &data[..data.len().min(MAX_HEX_INPUT)];
     let mut out = String::new();
     for (i, chunk) in data.chunks(16).enumerate() {
-        write!(out, "{:08x}  ", i * 16).unwrap();
+        let _ = write!(out, "{:08x}  ", i * 16);
 
         for (j, byte) in chunk.iter().enumerate() {
-            write!(out, "{:02x} ", byte).unwrap();
+            let _ = write!(out, "{:02x} ", byte);
             if j == 7 {
                 out.push(' ');
             }
@@ -479,7 +479,7 @@ pub fn format_hex(data: &[u8]) -> String {
         out.push_str("|\n");
     }
     if truncated {
-        writeln!(out, "[... truncated, {} bytes total]", original_len).unwrap();
+        let _ = writeln!(out, "[... truncated, {} bytes total]", original_len);
     }
     out
 }

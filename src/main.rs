@@ -610,8 +610,15 @@ fn run_tui_mode(
             // TUI exited cleanly but capture had an error — report it
             result.and(Err(e))
         }
-        // M5: Handle thread panic
-        Err(_) => result.and(Err(anyhow::anyhow!("capture thread panicked"))),
+        // M5: Handle thread panic — extract message for debuggability
+        Err(e) => {
+            let msg = e
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| e.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown cause");
+            result.and(Err(anyhow::anyhow!("capture thread panicked: {msg}")))
+        }
         Ok(Ok(())) => result,
     }
 }

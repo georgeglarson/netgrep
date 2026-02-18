@@ -173,10 +173,9 @@ impl DirectionBuffer {
                 .copied();
             match overlapping {
                 Some(seg_seq) => {
-                    let seg_data = self
-                        .reorder_buf
-                        .remove(&seg_seq)
-                        .expect("seg_seq found by preceding .find().copied()");
+                    let Some(seg_data) = self.reorder_buf.remove(&seg_seq) else {
+                        break;
+                    };
                     let overlap = expected.wrapping_sub(seg_seq) as usize;
                     if overlap < seg_data.len() {
                         if !self.truncated {

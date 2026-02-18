@@ -352,8 +352,8 @@ fn decode_chunked(data: &[u8]) -> Option<(Vec<u8>, usize)> {
             break;
         }
 
-        // M11: Enforce body size limit
-        if decoded.len() + chunk_size > MAX_CHUNKED_BODY {
+        // M11: Enforce body size limit (use saturating_sub to avoid overflow)
+        if chunk_size > MAX_CHUNKED_BODY.saturating_sub(decoded.len()) {
             return None;
         }
 

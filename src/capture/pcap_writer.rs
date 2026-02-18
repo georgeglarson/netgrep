@@ -33,11 +33,14 @@ impl<W: Write> PcapWriter<W> {
         let ts_usec = duration.subsec_micros();
         let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
 
-        self.writer.write_all(&ts_sec.to_ne_bytes())?;
-        self.writer.write_all(&ts_usec.to_ne_bytes())?;
-        self.writer.write_all(&len.to_ne_bytes())?; // incl_len
-        self.writer.write_all(&len.to_ne_bytes())?; // orig_len
-        self.writer.write_all(data)?;
+        // Build packet record in a single buffer to avoid partial writes on error
+        let mut record = Vec::with_capacity(16 + data.len());
+        record.extend_from_slice(&ts_sec.to_ne_bytes());
+        record.extend_from_slice(&ts_usec.to_ne_bytes());
+        record.extend_from_slice(&len.to_ne_bytes()); // incl_len
+        record.extend_from_slice(&len.to_ne_bytes()); // orig_len
+        record.extend_from_slice(data);
+        self.writer.write_all(&record)?;
         Ok(())
     }
 }

@@ -175,8 +175,11 @@ pub fn run_tui(
         // Drain all pending events from channel
         let auto_select = app.events.is_empty();
         while let Ok(event) = rx.try_recv() {
-            if app.events.len() < MAX_TUI_EVENTS && app.events_bytes < MAX_TUI_BYTES {
-                app.events_bytes = app.events_bytes.saturating_add(event.approx_bytes());
+            let event_bytes = event.approx_bytes();
+            if app.events.len() < MAX_TUI_EVENTS
+                && app.events_bytes.saturating_add(event_bytes) <= MAX_TUI_BYTES
+            {
+                app.events_bytes += event_bytes;
                 app.events.push(event);
             } else {
                 // M22: Track dropped events

@@ -753,70 +753,74 @@ impl TlsDecryptor {
 
         let mut ciphertext = record.data.to_vec();
 
-        if iv_len == 4 {
-            // AES-GCM: first 8 bytes are explicit nonce, then ciphertext + 16-byte tag
-            // Need at least 8 (nonce) + 16 (tag) = 24 bytes minimum
-            if ciphertext.len() < 24 {
-                return None;
+        match iv_len {
+            4 => {
+                // AES-GCM: first 8 bytes are explicit nonce, then ciphertext + 16-byte tag
+                // Need at least 8 (nonce) + 16 (tag) = 24 bytes minimum
+                if ciphertext.len() < 24 {
+                    return None;
+                }
+                let explicit_nonce: Vec<u8> = ciphertext.drain(..8).collect();
+
+                // L5: AAD on the stack: seq_num(8) + type(1) + version(2) + plaintext_length(2)
+                let plaintext_len = ciphertext.len() - 16; // minus tag (safe: checked >= 24 above)
+                let pt_len_bytes = u16::try_from(plaintext_len).ok()?.to_be_bytes();
+                let seq_bytes = keys.seq_num().to_be_bytes();
+                let ver_bytes = u16::from(record.hdr.version).to_be_bytes();
+                let aad: [u8; 13] = [
+                    seq_bytes[0],
+                    seq_bytes[1],
+                    seq_bytes[2],
+                    seq_bytes[3],
+                    seq_bytes[4],
+                    seq_bytes[5],
+                    seq_bytes[6],
+                    seq_bytes[7],
+                    record.hdr.record_type.0,
+                    ver_bytes[0],
+                    ver_bytes[1],
+                    pt_len_bytes[0],
+                    pt_len_bytes[1],
+                ];
+
+                let result = keys.decrypt_tls12_record(&mut ciphertext, &aad, &explicit_nonce);
+                ciphertext.zeroize(); // Zeroize in-place decrypted plaintext
+                result.ok()
             }
-            let explicit_nonce: Vec<u8> = ciphertext.drain(..8).collect();
+            12 => {
+                // ChaCha20-Poly1305: no explicit nonce, 16-byte tag appended
+                // Need at least 16 (tag) bytes
+                if ciphertext.len() < 16 {
+                    return None;
+                }
 
-            // L5: AAD on the stack: seq_num(8) + type(1) + version(2) + plaintext_length(2)
-            let plaintext_len = ciphertext.len() - 16; // minus tag (safe: checked >= 24 above)
-            let pt_len_bytes = u16::try_from(plaintext_len).ok()?.to_be_bytes();
-            let seq_bytes = keys.seq_num().to_be_bytes();
-            let ver_bytes = u16::from(record.hdr.version).to_be_bytes();
-            let aad: [u8; 13] = [
-                seq_bytes[0],
-                seq_bytes[1],
-                seq_bytes[2],
-                seq_bytes[3],
-                seq_bytes[4],
-                seq_bytes[5],
-                seq_bytes[6],
-                seq_bytes[7],
-                record.hdr.record_type.0,
-                ver_bytes[0],
-                ver_bytes[1],
-                pt_len_bytes[0],
-                pt_len_bytes[1],
-            ];
+                // L5: AAD on the stack: seq_num(8) + type(1) + version(2) + plaintext_length(2)
+                let plaintext_len = ciphertext.len() - 16;
+                let pt_len_bytes = u16::try_from(plaintext_len).ok()?.to_be_bytes();
+                let seq_bytes = keys.seq_num().to_be_bytes();
+                let ver_bytes = u16::from(record.hdr.version).to_be_bytes();
+                let aad: [u8; 13] = [
+                    seq_bytes[0],
+                    seq_bytes[1],
+                    seq_bytes[2],
+                    seq_bytes[3],
+                    seq_bytes[4],
+                    seq_bytes[5],
+                    seq_bytes[6],
+                    seq_bytes[7],
+                    record.hdr.record_type.0,
+                    ver_bytes[0],
+                    ver_bytes[1],
+                    pt_len_bytes[0],
+                    pt_len_bytes[1],
+                ];
 
-            let result = keys.decrypt_tls12_record(&mut ciphertext, &aad, &explicit_nonce);
-            ciphertext.zeroize(); // Zeroize in-place decrypted plaintext
-            result.ok()
-        } else {
-            // ChaCha20-Poly1305: no explicit nonce, 16-byte tag appended
-            // Need at least 16 (tag) bytes
-            if ciphertext.len() < 16 {
-                return None;
+                // Use build_nonce (XOR seq with full 12-byte IV) via decrypt_record
+                let result = keys.decrypt_record(&mut ciphertext, &aad);
+                ciphertext.zeroize(); // Zeroize in-place decrypted plaintext
+                result.ok()
             }
-
-            // L5: AAD on the stack: seq_num(8) + type(1) + version(2) + plaintext_length(2)
-            let plaintext_len = ciphertext.len() - 16;
-            let pt_len_bytes = u16::try_from(plaintext_len).ok()?.to_be_bytes();
-            let seq_bytes = keys.seq_num().to_be_bytes();
-            let ver_bytes = u16::from(record.hdr.version).to_be_bytes();
-            let aad: [u8; 13] = [
-                seq_bytes[0],
-                seq_bytes[1],
-                seq_bytes[2],
-                seq_bytes[3],
-                seq_bytes[4],
-                seq_bytes[5],
-                seq_bytes[6],
-                seq_bytes[7],
-                record.hdr.record_type.0,
-                ver_bytes[0],
-                ver_bytes[1],
-                pt_len_bytes[0],
-                pt_len_bytes[1],
-            ];
-
-            // Use build_nonce (XOR seq with full 12-byte IV) via decrypt_record
-            let result = keys.decrypt_record(&mut ciphertext, &aad);
-            ciphertext.zeroize(); // Zeroize in-place decrypted plaintext
-            result.ok()
+            _ => None, // Unsupported iv_len
         }
     }
 }
