@@ -510,6 +510,7 @@ mod tests {
             },
             headers: vec![],
             body: String::new(),
+            smuggling_risk: false,
         };
         let event = CaptureEvent::from_h2_messages(1, &key, &[msg]);
         assert_eq!(event.summary.proto, "HTTP");
@@ -527,6 +528,7 @@ mod tests {
             },
             headers: vec![],
             body: String::new(),
+            smuggling_risk: false,
         };
         let msg2 = HttpMessage {
             kind: HttpKind::Response {
@@ -536,6 +538,7 @@ mod tests {
             },
             headers: vec![],
             body: String::new(),
+            smuggling_risk: false,
         };
         let event = CaptureEvent::from_h2_messages(2, &key, &[msg1, msg2]);
         assert!(event.detail.header().contains("+1 more"));

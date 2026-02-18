@@ -699,6 +699,7 @@ mod tests {
             },
             headers: vec![("Host".into(), "example.com".into())],
             body: String::new(),
+            smuggling_risk: false,
         };
         let (header, body) = f.format_http_text("stream-1", &msg, &None);
         assert!(header.contains("HTTP"));
@@ -718,6 +719,7 @@ mod tests {
             },
             headers: vec![],
             body: "hello".into(),
+            smuggling_risk: false,
         };
         let (header, body) = f.format_http_text("stream-2", &msg, &None);
         assert!(header.contains("200 OK"));
@@ -815,6 +817,7 @@ mod tests {
             },
             headers: vec![],
             body: String::new(),
+            smuggling_risk: false,
         };
         let j = f.format_http_json("stream-1", &msg);
         assert_eq!(j["type"], "http");

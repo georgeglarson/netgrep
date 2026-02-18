@@ -21,10 +21,8 @@ pub(crate) struct HandshakeResult {
 /// used to preserve ClientHello's supported_versions detection over ServerHello's
 /// legacy version field.
 ///
-/// **Limitation (L25):** This assumes the handshake message fits in a single TLS record.
-/// Handshake messages spanning multiple records (fragmented handshakes) are not reassembled
-/// and will fail to parse. This is acceptable for typical deployments where ClientHello and
-/// ServerHello fit in one record.
+/// M8: Callers should use `TlsDecryptor::accumulate_handshake` to reassemble
+/// handshake messages spanning multiple TLS records before calling this function.
 pub(crate) fn parse_handshake(
     data: &[u8],
     src_ip: IpAddr,

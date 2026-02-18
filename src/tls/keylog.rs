@@ -47,9 +47,13 @@ impl KeyLog {
                 path.display()
             );
         }
-        let contents = std::fs::read_to_string(path)
-            .context(format!("Failed to read keylog: {}", path.display()))?;
-        Self::parse(&contents)
+        // M9: Read into a Vec<u8> so we can zeroize after parsing.
+        let mut raw =
+            std::fs::read(path).context(format!("Failed to read keylog: {}", path.display()))?;
+        let contents = String::from_utf8_lossy(&raw);
+        let result = Self::parse(&contents);
+        raw.zeroize();
+        result
     }
 
     pub fn parse(contents: &str) -> Result<Self> {

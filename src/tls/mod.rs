@@ -15,6 +15,9 @@ use crate::protocol::StreamKey;
 use decrypt::DirectionKeys;
 use keylog::KeyLog;
 
+/// Maximum accumulated handshake message size (64 KB — covers even post-quantum ClientHello).
+const MAX_HANDSHAKE_BUF: usize = 65536;
+
 /// Per-connection TLS state tracker.
 struct TlsConnection {
     client_random: Option<[u8; 32]>,
@@ -42,6 +45,14 @@ struct TlsConnection {
     last_active: u64,
     /// IV length from cipher suite (4 for AES-GCM, 12 for ChaCha20/TLS 1.3).
     iv_len: usize,
+    /// M8: Per-direction handshake message reassembly buffer for messages
+    /// spanning multiple TLS records. Keyed by direction (true = from_client).
+    handshake_buf_client: Vec<u8>,
+    handshake_buf_server: Vec<u8>,
+    /// M10: Tracks whether the TLS 1.3 handshake phase is complete per direction.
+    /// Once true, only application keys are tried (no dual-try fallback).
+    client_hs_complete: bool,
+    server_hs_complete: bool,
 }
 
 impl TlsConnection {
@@ -63,6 +74,10 @@ impl TlsConnection {
             decrypted: Vec::new(),
             last_active: 0,
             iv_len: 4,
+            handshake_buf_client: Vec::new(),
+            handshake_buf_server: Vec::new(),
+            client_hs_complete: false,
+            server_hs_complete: false,
         }
     }
 
@@ -81,6 +96,8 @@ impl Drop for TlsConnection {
         self.from_client_buf.zeroize();
         self.from_server_buf.zeroize();
         self.decrypted.zeroize();
+        self.handshake_buf_client.zeroize();
+        self.handshake_buf_server.zeroize();
     }
 }
 
@@ -276,7 +293,10 @@ impl TlsDecryptor {
                     }
                 }
                 TlsRecordType::Handshake if !cipher_active => {
-                    self.process_handshake(key, record.data, src_ip, src_port);
+                    // M8: Reassemble handshake messages across TLS records.
+                    // The handshake message header is 4 bytes: type(1) + length(3).
+                    // Accumulate data until we have the full message.
+                    self.accumulate_handshake(key, record.data, from_client, src_ip, src_port);
                 }
                 // After CCS, handshake records (Finished) are encrypted — decrypt to advance seq
                 TlsRecordType::Handshake | TlsRecordType::ApplicationData => {
@@ -306,6 +326,62 @@ impl TlsDecryptor {
                 conn.from_server_buf = leftover;
             }
         }
+    }
+
+    /// M8: Accumulate handshake record data and dispatch complete messages.
+    /// Handles handshake messages that span multiple TLS records by buffering
+    /// until the full message (per the 3-byte length field) is available.
+    fn accumulate_handshake(
+        &mut self,
+        key: &StreamKey,
+        data: &[u8],
+        from_client: bool,
+        src_ip: IpAddr,
+        src_port: u16,
+    ) {
+        // Append data to the direction's handshake buffer and check for completeness.
+        // We extract the complete message (if any) while holding the borrow, then
+        // release it before calling process_handshake (which needs &mut self).
+        let complete_msg = {
+            let conn = match self.connections.get_mut(key) {
+                Some(c) => c,
+                None => return,
+            };
+
+            let buf = if from_client {
+                &mut conn.handshake_buf_client
+            } else {
+                &mut conn.handshake_buf_server
+            };
+
+            // Check size limit before appending
+            if buf.len() + data.len() > MAX_HANDSHAKE_BUF {
+                buf.clear();
+                return;
+            }
+
+            buf.extend_from_slice(data);
+
+            // Need at least 4 bytes for a handshake header: type(1) + length(3)
+            if buf.len() < 4 {
+                return;
+            }
+
+            // Parse handshake message length
+            let msg_len = ((buf[1] as usize) << 16) | ((buf[2] as usize) << 8) | (buf[3] as usize);
+            let total_len = 4 + msg_len;
+
+            if buf.len() < total_len {
+                return; // Incomplete — wait for more records
+            }
+
+            // Extract the complete message and drain the buffer
+            let msg = buf[..total_len].to_vec();
+            buf.drain(..total_len);
+            msg
+        };
+
+        self.process_handshake(key, &complete_msg, src_ip, src_port);
     }
 
     fn process_handshake(&mut self, key: &StreamKey, data: &[u8], src_ip: IpAddr, src_port: u16) {
@@ -503,12 +579,12 @@ impl TlsDecryptor {
         }
     }
 
-    /// Try to decrypt a TLS 1.3 record, trying handshake keys first, then application keys.
+    /// Try to decrypt a TLS 1.3 record.
     ///
-    /// Flow: handshake keys are tried first. If they succeed, the result is returned
-    /// immediately (application data or None for non-0x17 content types like Finished).
-    /// Application keys are only tried if handshake keys fail to decrypt the record.
-    /// Once application keys succeed, handshake keys are discarded for this connection.
+    /// M10: Uses per-direction phase flags to avoid fragile dual-try logic.
+    /// Before handshake is complete: try handshake keys, fall back to application keys.
+    /// After handshake is complete: only try application keys (no fallback).
+    /// This prevents sequence counter desync from incorrect key phase selection.
     fn decrypt_tls13_record(
         &mut self,
         key: &StreamKey,
@@ -530,32 +606,44 @@ impl TlsDecryptor {
 
         let conn = self.connections.get_mut(key)?;
 
-        // Try handshake keys first (clone ciphertext since open_in_place corrupts on failure)
-        let hs_keys = if is_from_client {
-            conn.client_hs_keys.as_mut()
+        let hs_complete = if is_from_client {
+            conn.client_hs_complete
         } else {
-            conn.server_hs_keys.as_mut()
+            conn.server_hs_complete
         };
-        if let Some(keys) = hs_keys {
-            let mut ct = record.data.to_vec();
-            if let Ok(plaintext) = keys.decrypt_record(&mut ct, &aad)
-                && let Some((data, content_type)) = Self::strip_tls13_content_type(plaintext)
-            {
-                // Only return application data (0x17), skip handshake (0x16) etc.
-                if content_type == 0x17 {
-                    return Some(data);
+
+        // Phase 1: Try handshake keys (only if handshake not yet complete for this direction)
+        if !hs_complete {
+            let hs_keys = if is_from_client {
+                conn.client_hs_keys.as_mut()
+            } else {
+                conn.server_hs_keys.as_mut()
+            };
+            if let Some(keys) = hs_keys {
+                let mut ct = record.data.to_vec();
+                if let Ok(plaintext) = keys.decrypt_record(&mut ct, &aad)
+                    && let Some((data, content_type)) = Self::strip_tls13_content_type(plaintext)
+                {
+                    if content_type == 0x17 {
+                        return Some(data);
+                    }
+                    // M7: Detect KeyUpdate (handshake type 24) — discard keys
+                    if content_type == 0x16 && data.first() == Some(&24) {
+                        eprintln!(
+                            "Warning: TLS 1.3 KeyUpdate detected; discarding keys for this direction"
+                        );
+                        if is_from_client {
+                            conn.client_hs_keys = None;
+                        } else {
+                            conn.server_hs_keys = None;
+                        }
+                    }
+                    return None;
                 }
-                // M21: Detect KeyUpdate (handshake type 24) in handshake content
-                if content_type == 0x16 && data.first() == Some(&24) {
-                    eprintln!(
-                        "Warning: TLS 1.3 KeyUpdate detected; subsequent records may fail to decrypt"
-                    );
-                }
-                return None;
             }
         }
 
-        // Try application keys
+        // Phase 2: Try application keys
         let app_keys = if is_from_client {
             conn.client_keys.as_mut()
         } else {
@@ -567,17 +655,29 @@ impl TlsDecryptor {
                 && let Some((data, content_type)) = Self::strip_tls13_content_type(plaintext)
             {
                 if content_type == 0x17 {
-                    // Handshake is complete — discard handshake keys to avoid
-                    // wasting cycles trying them on every subsequent record.
-                    conn.client_hs_keys = None;
-                    conn.server_hs_keys = None;
+                    // M10: Mark handshake as complete for this direction.
+                    // Discard handshake keys to avoid dual-try on subsequent records.
+                    if !hs_complete {
+                        if is_from_client {
+                            conn.client_hs_complete = true;
+                            conn.client_hs_keys = None;
+                        } else {
+                            conn.server_hs_complete = true;
+                            conn.server_hs_keys = None;
+                        }
+                    }
                     return Some(data);
                 }
-                // M21: Detect KeyUpdate (handshake type 24) in application keys
+                // M7: Detect KeyUpdate (handshake type 24) — discard keys
                 if content_type == 0x16 && data.first() == Some(&24) {
                     eprintln!(
-                        "Warning: TLS 1.3 KeyUpdate detected; subsequent records may fail to decrypt"
+                        "Warning: TLS 1.3 KeyUpdate detected; discarding keys for this direction"
                     );
+                    if is_from_client {
+                        conn.client_keys = None;
+                    } else {
+                        conn.server_keys = None;
+                    }
                 }
                 return None;
             }

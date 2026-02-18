@@ -25,9 +25,12 @@ const MAX_FRAME_PAYLOAD: usize = 16_777_215; // 2^24 - 1
 const MAX_STREAMS_PER_CONN: usize = 1_000;
 const MAX_HEADER_BLOCK: usize = 65_536;
 const MAX_DATA_PER_STREAM: usize = 1_048_576; // 1 MB
-const MAX_CONNECTIONS: usize = 10_000;
-/// M1: Cap per-direction buffer to prevent unbounded memory growth.
-const MAX_DIRECTION_BUF: usize = 16 * 1024 * 1024; // 16 MB
+/// M1: Reduced from 10,000 to 2,000 to cap compound memory usage.
+/// 2,000 connections * 2 MB * 2 directions = ~8 GB worst case.
+const MAX_CONNECTIONS: usize = 2_000;
+/// M1: Cap per-direction buffer. Reduced from 16 MB to 2 MB to keep
+/// aggregate memory bounded (~8 GB worst case with MAX_CONNECTIONS).
+const MAX_DIRECTION_BUF: usize = 2 * 1024 * 1024; // 2 MB
 
 /// Direction of data flow within a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -55,12 +58,12 @@ struct H2Connection {
     detected: Option<bool>,
     /// Monotonic tick for LRU eviction.
     last_active: u64,
-    /// Accumulates header block fragments for discarded streams (rejected at
+    /// M3: Accumulates header block fragments for discarded streams (rejected at
     /// stream limit) or PUSH_PROMISE frames that span multiple CONTINUATION
     /// frames. HPACK is stateful — every header block must be decoded even if
     /// the headers are discarded, otherwise the dynamic table becomes corrupted.
-    /// Format: (stream_id, direction, accumulated_header_bytes).
-    discard_header_buf: Option<(u32, H2Direction, Vec<u8>)>,
+    /// Uses a HashMap to track multiple concurrent discarded streams.
+    discard_header_bufs: HashMap<u32, (H2Direction, Vec<u8>)>,
 }
 
 struct H2Stream {
@@ -78,6 +81,10 @@ struct H2Stream {
     end_stream_headers: bool,
     /// Whether END_STREAM was set on a DATA frame.
     end_stream_data: bool,
+    /// M2: Set when accumulated header block exceeds MAX_HEADER_BLOCK.
+    /// When true, HPACK decoding is skipped to avoid partial dynamic table
+    /// mutation from a truncated header block.
+    header_overflow: bool,
 }
 
 impl H2Stream {
@@ -90,6 +97,7 @@ impl H2Stream {
             end_headers: false,
             end_stream_headers: false,
             end_stream_data: false,
+            header_overflow: false,
         }
     }
 }
@@ -104,7 +112,7 @@ impl H2Connection {
             server_buf: Vec::new(),
             detected: None,
             last_active: 0,
-            discard_header_buf: None,
+            discard_header_bufs: HashMap::new(),
         }
     }
 }
@@ -288,15 +296,18 @@ impl H2Tracker {
                             if header_block.len() <= MAX_HEADER_BLOCK {
                                 buf.extend_from_slice(header_block);
                             }
-                            conn.discard_header_buf = Some((stream_id, direction, buf));
+                            conn.discard_header_bufs.insert(stream_id, (direction, buf));
                         }
                         continue;
                     }
 
                     let stream = conn.streams.entry(stream_id).or_insert_with(H2Stream::new);
 
+                    // M2: Track header block overflow to avoid partial HPACK decode
                     if stream.header_buf.len() + header_block.len() <= MAX_HEADER_BLOCK {
                         stream.header_buf.extend_from_slice(header_block);
+                    } else {
+                        stream.header_overflow = true;
                     }
 
                     if end_stream {
@@ -305,11 +316,13 @@ impl H2Tracker {
 
                     if end_headers {
                         stream.end_headers = true;
-                        let decoder = match direction {
-                            H2Direction::ClientToServer => &mut conn.client_decoder,
-                            H2Direction::ServerToClient => &mut conn.server_decoder,
-                        };
-                        decode_headers(stream, decoder);
+                        if !stream.header_overflow {
+                            let decoder = match direction {
+                                H2Direction::ClientToServer => &mut conn.client_decoder,
+                                H2Direction::ServerToClient => &mut conn.server_decoder,
+                            };
+                            decode_headers(stream, decoder);
+                        }
 
                         if stream.end_stream_headers {
                             if let Some(msg) = build_message(stream) {
@@ -322,18 +335,25 @@ impl H2Tracker {
                 FRAME_CONTINUATION => {
                     if let Some(stream) = conn.streams.get_mut(&stream_id) {
                         if !stream.end_headers {
-                            if stream.header_buf.len() + frame_payload.len() <= MAX_HEADER_BLOCK {
+                            // M2: Track overflow instead of silently dropping
+                            if stream.header_buf.len() + frame_payload.len() <= MAX_HEADER_BLOCK
+                                && !stream.header_overflow
+                            {
                                 stream.header_buf.extend_from_slice(&frame_payload);
+                            } else {
+                                stream.header_overflow = true;
                             }
 
                             let end_headers = flags & FLAG_END_HEADERS != 0;
                             if end_headers {
                                 stream.end_headers = true;
-                                let decoder = match direction {
-                                    H2Direction::ClientToServer => &mut conn.client_decoder,
-                                    H2Direction::ServerToClient => &mut conn.server_decoder,
-                                };
-                                decode_headers(stream, decoder);
+                                if !stream.header_overflow {
+                                    let decoder = match direction {
+                                        H2Direction::ClientToServer => &mut conn.client_decoder,
+                                        H2Direction::ServerToClient => &mut conn.server_decoder,
+                                    };
+                                    decode_headers(stream, decoder);
+                                }
 
                                 if stream.end_stream_headers {
                                     if let Some(msg) = build_message(stream) {
@@ -347,10 +367,11 @@ impl H2Tracker {
                         // CONTINUATION for a discarded stream or PUSH_PROMISE —
                         // accumulate fragments and decode HPACK when complete.
                         let end_headers = flags & FLAG_END_HEADERS != 0;
-                        if let Some((discard_sid, discard_dir, ref mut buf)) =
-                            conn.discard_header_buf
-                            && discard_sid == stream_id
+                        // M3: Use HashMap to track multiple discarded streams
+                        if let Some((discard_dir, buf)) =
+                            conn.discard_header_bufs.get_mut(&stream_id)
                         {
+                            let discard_dir = *discard_dir;
                             if buf.len() + frame_payload.len() <= MAX_HEADER_BLOCK {
                                 buf.extend_from_slice(&frame_payload);
                             }
@@ -360,7 +381,7 @@ impl H2Tracker {
                                     H2Direction::ServerToClient => &mut conn.server_decoder,
                                 };
                                 let _ = decoder.decode(buf);
-                                conn.discard_header_buf = None;
+                                conn.discard_header_bufs.remove(&stream_id);
                             }
                             continue;
                         }
@@ -449,7 +470,7 @@ impl H2Tracker {
                         if header_block.len() <= MAX_HEADER_BLOCK {
                             buf.extend_from_slice(header_block);
                         }
-                        conn.discard_header_buf = Some((stream_id, direction, buf));
+                        conn.discard_header_bufs.insert(stream_id, (direction, buf));
                     }
                 }
                 FRAME_SETTINGS => {
@@ -575,6 +596,7 @@ fn build_message(stream: &H2Stream) -> Option<HttpMessage> {
         kind,
         headers: stream.headers.clone(),
         body,
+        smuggling_risk: false,
     })
 }
 

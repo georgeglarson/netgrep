@@ -6,6 +6,10 @@ pub struct HttpMessage {
     pub kind: HttpKind,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// H1: True when both Content-Length and Transfer-Encoding are present,
+    /// indicating a potential HTTP request smuggling vector.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub smuggling_risk: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,6 +54,13 @@ impl HttpMessage {
             let _ = write!(out, "{}: {}\r\n", k, v);
         }
 
+        if self.smuggling_risk {
+            let _ = write!(
+                out,
+                "*** WARNING: Both Content-Length and Transfer-Encoding present (potential request smuggling) ***\r\n"
+            );
+        }
+
         out.push_str("\r\n");
 
         if !self.body.is_empty() {
@@ -86,9 +97,13 @@ const KNOWN_METHODS: &[&str] = &[
 /// M11: Maximum chunked body size (10 MB).
 const MAX_CHUNKED_BODY: usize = 10 * 1024 * 1024;
 
-/// Maximum close-delimited response body size (1 MB).
-/// Independent of stream reassembly limits for defense in depth.
+/// Maximum response body size (1 MB) for both Content-Length and
+/// close-delimited bodies. Independent of stream reassembly limits
+/// for defense in depth.
 const MAX_BODY_SIZE: usize = 1_048_576;
+
+/// Maximum number of HTTP messages parsed from a single stream.
+const MAX_MESSAGES_PER_PARSE: usize = 200;
 
 /// H1: Find the start of the next HTTP message in a byte slice.
 /// Looks for request methods and "HTTP/" response starts.
@@ -97,37 +112,77 @@ const MAX_BODY_SIZE: usize = 1_048_576;
 /// M6: Requires full "HTTP/x.y NNN" pattern for response starts to reduce
 /// false splits in close-delimited response bodies.
 fn find_next_http_start(data: &[u8]) -> Option<usize> {
+    // Map each method's first byte to the methods starting with that byte,
+    // so we only check relevant methods per byte (avoids quadratic scan).
+    const METHOD_G: &[&str] = &["GET"];
+    const METHOD_P: &[&str] = &["POST", "PUT", "PATCH"];
+    const METHOD_D: &[&str] = &["DELETE"];
+    const METHOD_C: &[&str] = &["CONNECT"];
+    const METHOD_O: &[&str] = &["OPTIONS"];
+    const METHOD_T: &[&str] = &["TRACE"];
+
     for i in 0..data.len() {
-        // M7: Filter by first byte before attempting starts_with comparisons
-        match data[i] {
+        let remaining = &data[i..];
+        match remaining[0] {
             b'H' => {
                 // M6: Require "HTTP/" followed by digit.digit space digit
-                // to avoid false-matching "HTTP/" in body content.
-                if data.len() >= i + 10
-                    && data[i..].starts_with(b"HTTP/")
-                    && data[i + 5].is_ascii_digit()
-                    && data[i + 6] == b'.'
-                    && data[i + 7].is_ascii_digit()
-                    && data[i + 8] == b' '
-                    && data[i + 9].is_ascii_digit()
+                if remaining.len() >= 10
+                    && remaining.starts_with(b"HTTP/")
+                    && remaining[5].is_ascii_digit()
+                    && remaining[6] == b'.'
+                    && remaining[7].is_ascii_digit()
+                    && remaining[8] == b' '
+                    && remaining[9].is_ascii_digit()
                 {
                     return Some(i);
                 }
             }
-            b'G' | b'P' | b'D' | b'C' | b'O' | b'T' => {
-                for method in KNOWN_METHODS {
-                    if data[i..].starts_with(method.as_bytes()) {
-                        let after = i + method.len();
-                        if after < data.len() && data[after] == b' ' {
-                            return Some(i);
-                        }
-                    }
+            b'G' => {
+                if check_methods(remaining, METHOD_G) {
+                    return Some(i);
+                }
+            }
+            b'P' => {
+                if check_methods(remaining, METHOD_P) {
+                    return Some(i);
+                }
+            }
+            b'D' => {
+                if check_methods(remaining, METHOD_D) {
+                    return Some(i);
+                }
+            }
+            b'C' => {
+                if check_methods(remaining, METHOD_C) {
+                    return Some(i);
+                }
+            }
+            b'O' => {
+                if check_methods(remaining, METHOD_O) {
+                    return Some(i);
+                }
+            }
+            b'T' => {
+                if check_methods(remaining, METHOD_T) {
+                    return Some(i);
                 }
             }
             _ => {}
         }
     }
     None
+}
+
+/// Check if remaining data starts with any of the given methods followed by a space.
+#[inline]
+fn check_methods(data: &[u8], methods: &[&str]) -> bool {
+    for method in methods {
+        let mb = method.as_bytes();
+        if data.len() > mb.len() && data.starts_with(mb) && data[mb.len()] == b' ' {
+            return true;
+        }
+    }
+    false
 }
 
 /// Try to parse one or more HTTP messages from a stream payload.
@@ -137,7 +192,7 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
     let mut messages = Vec::new();
     let mut remaining = data;
 
-    while !remaining.is_empty() {
+    while !remaining.is_empty() && messages.len() < MAX_MESSAGES_PER_PARSE {
         let (header_end, sep_len) = match find_header_end(remaining) {
             Some(result) => result,
             None => break,
@@ -206,6 +261,10 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
 
         let is_response = matches!(kind, HttpKind::Response { .. });
 
+        // H1: Flag potential HTTP request smuggling when both Content-Length
+        // and Transfer-Encoding are present (RFC 7230 Section 3.3.3).
+        let smuggling_risk = is_chunked && content_length.is_some();
+
         let (body, consumed) = if is_chunked {
             match decode_chunked(after_headers) {
                 Some((decoded, bytes_consumed)) => (
@@ -215,7 +274,7 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
                 None => (String::new(), 0),
             }
         } else if let Some(cl) = content_length {
-            let len = cl.min(after_headers.len());
+            let len = cl.min(after_headers.len()).min(MAX_BODY_SIZE);
             (
                 String::from_utf8_lossy(&after_headers[..len]).into_owned(),
                 len,
@@ -240,6 +299,7 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
             kind,
             headers,
             body,
+            smuggling_risk,
         });
     }
 
