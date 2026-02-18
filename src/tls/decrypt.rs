@@ -149,6 +149,11 @@ pub fn derive_tls12_keys(
     aead_algo: &'static aead::Algorithm,
     hmac_algo: hmac::Algorithm,
 ) -> Result<(DirectionKeys, DirectionKeys)> {
+    // Issue #7: Validate iv_len before using it for slice indexing
+    if iv_len > 12 {
+        return Err(anyhow::anyhow!("iv_len {} exceeds maximum of 12", iv_len));
+    }
+
     let mut seed = Vec::with_capacity(64);
     seed.extend_from_slice(server_random);
     seed.extend_from_slice(client_random);
@@ -224,6 +229,8 @@ fn hkdf_expand_label(prk: &hkdf::Prk, label: &[u8], context: &[u8], len: usize) 
     let mut out = vec![0u8; len];
     okm.fill(&mut out)
         .map_err(|_| anyhow::anyhow!("HKDF fill failed"))?;
+    // L5: Zeroize HKDF info buffer (contains label material)
+    info.zeroize();
     Ok(out)
 }
 

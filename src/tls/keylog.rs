@@ -89,51 +89,62 @@ impl KeyLog {
                 Some(cr) => cr,
                 None => continue,
             };
-            let secret = match decode_hex(parts[2]) {
+            let mut secret = match decode_hex(parts[2]) {
                 Some(s) => s,
                 None => continue,
             };
 
             match label {
                 "CLIENT_RANDOM" => {
-                    keylog.master_secrets.insert(client_random, secret);
+                    // Issue #8: Validate master secret is exactly 48 bytes
+                    if secret.len() != 48 {
+                        secret.zeroize();
+                        continue;
+                    }
+                    // Zeroize old secret if overwriting
+                    if let Some(mut old) = keylog.master_secrets.insert(client_random, secret) {
+                        old.zeroize();
+                    }
                 }
                 "CLIENT_HANDSHAKE_TRAFFIC_SECRET" => {
-                    keylog
-                        .tls13_secrets
-                        .entry(client_random)
-                        .or_default()
-                        .client_handshake_traffic_secret = Some(secret);
+                    let entry = keylog.tls13_secrets.entry(client_random).or_default();
+                    if let Some(ref mut old) = entry.client_handshake_traffic_secret {
+                        old.zeroize();
+                    }
+                    entry.client_handshake_traffic_secret = Some(secret);
                 }
                 "SERVER_HANDSHAKE_TRAFFIC_SECRET" => {
-                    keylog
-                        .tls13_secrets
-                        .entry(client_random)
-                        .or_default()
-                        .server_handshake_traffic_secret = Some(secret);
+                    let entry = keylog.tls13_secrets.entry(client_random).or_default();
+                    if let Some(ref mut old) = entry.server_handshake_traffic_secret {
+                        old.zeroize();
+                    }
+                    entry.server_handshake_traffic_secret = Some(secret);
                 }
                 "CLIENT_TRAFFIC_SECRET_0" => {
-                    keylog
-                        .tls13_secrets
-                        .entry(client_random)
-                        .or_default()
-                        .client_traffic_secret_0 = Some(secret);
+                    let entry = keylog.tls13_secrets.entry(client_random).or_default();
+                    if let Some(ref mut old) = entry.client_traffic_secret_0 {
+                        old.zeroize();
+                    }
+                    entry.client_traffic_secret_0 = Some(secret);
                 }
                 "SERVER_TRAFFIC_SECRET_0" => {
-                    keylog
-                        .tls13_secrets
-                        .entry(client_random)
-                        .or_default()
-                        .server_traffic_secret_0 = Some(secret);
+                    let entry = keylog.tls13_secrets.entry(client_random).or_default();
+                    if let Some(ref mut old) = entry.server_traffic_secret_0 {
+                        old.zeroize();
+                    }
+                    entry.server_traffic_secret_0 = Some(secret);
                 }
                 "CLIENT_EARLY_TRAFFIC_SECRET" => {
-                    keylog
-                        .tls13_secrets
-                        .entry(client_random)
-                        .or_default()
-                        .client_early_traffic_secret = Some(secret);
+                    let entry = keylog.tls13_secrets.entry(client_random).or_default();
+                    if let Some(ref mut old) = entry.client_early_traffic_secret {
+                        old.zeroize();
+                    }
+                    entry.client_early_traffic_secret = Some(secret);
                 }
-                _ => {}
+                _ => {
+                    // L3: Zeroize secret for unrecognized labels
+                    secret.zeroize();
+                }
             }
         }
 
@@ -152,12 +163,15 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 }
 
 fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
-    let bytes = decode_hex(s)?;
+    let mut bytes = decode_hex(s)?;
     if bytes.len() != 32 {
+        // L4: Zeroize intermediate hex bytes before returning
+        bytes.zeroize();
         return None;
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
+    bytes.zeroize();
     Some(arr)
 }
 
@@ -168,7 +182,7 @@ mod tests {
     #[test]
     fn parse_tls12_keylog() {
         let content = "CLIENT_RANDOM aabbccdd00000000000000000000000000000000000000000000000000000000 \
-                        0011223344556677889900112233445566778899001122334455667788990011223344556677889900112233445566\n";
+                        001122334455667788990011223344556677889900112233445566778899001122334455667788990011223344556677\n";
         let kl = KeyLog::parse(content).unwrap();
         assert_eq!(kl.master_secrets.len(), 1);
     }

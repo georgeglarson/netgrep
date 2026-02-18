@@ -127,8 +127,16 @@ impl CaptureEvent {
     }
 
     pub fn from_stream(id: usize, stream: &StreamData, http_mode: bool) -> Self {
-        let src = format!("{}:{}", stream.key.addr_a, stream.key.port_a);
-        let dst = format!("{}:{}", stream.key.addr_b, stream.key.port_b);
+        // Issue #10: Use stream.src_addr for correct src/dst display
+        // (StreamKey is bidirectional — addr_a/port_a may not be the actual source)
+        let (src_ip, src_port) = stream.src_addr;
+        let (dst_ip, dst_port) = if stream.key.addr_a == src_ip && stream.key.port_a == src_port {
+            (stream.key.addr_b, stream.key.port_b)
+        } else {
+            (stream.key.addr_a, stream.key.port_a)
+        };
+        let src = format!("{}:{}", src_ip, src_port);
+        let dst = format!("{}:{}", dst_ip, dst_port);
 
         if http_mode {
             let messages = http::parse_http(&stream.payload);
@@ -170,11 +178,13 @@ impl CaptureEvent {
     }
 
     fn from_dns(id: usize, src: &str, dst: &str, info: &DnsInfo) -> Self {
+        // Issue #12: Sanitize DNS fields at construction to prevent control
+        // characters from persisting in stored event data.
         let qname = info
             .questions
             .first()
-            .map(|q| q.name.as_str())
-            .unwrap_or("?");
+            .map(|q| crate::sanitize::sanitize_control_chars(&q.name))
+            .unwrap_or_else(|| "?".into());
         let qtype = info
             .questions
             .first()
@@ -298,7 +308,7 @@ impl CaptureEvent {
                 break;
             }
             if s.len() > remaining {
-                display.push_str(&s[..remaining]);
+                display.push_str(&s[..s.floor_char_boundary(remaining)]);
                 display.push_str("\n[truncated]");
                 break;
             }

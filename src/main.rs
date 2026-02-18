@@ -200,14 +200,14 @@ fn main() -> Result<()> {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = stop_flag.clone();
         if let Err(e) = ctrlc::set_handler(move || {
-            if stop_clone.load(Ordering::Relaxed) {
+            if stop_clone.load(Ordering::Acquire) {
                 // Second Ctrl+C — force exit.
                 // M10: process::exit bypasses Drop impls, so pcap writers won't
                 // flush and TLS key material won't be zeroized. Acceptable because
                 // the user is explicitly requesting immediate termination.
                 std::process::exit(1);
             }
-            stop_clone.store(true, Ordering::Relaxed);
+            stop_clone.store(true, Ordering::Release);
         }) {
             eprintln!("Warning: failed to install Ctrl+C handler: {}", e);
         }
@@ -314,11 +314,11 @@ fn run_cli_mode(
     use std::io::Write as _;
 
     source.for_each_packet(|packet_data| {
-        if stop_flag.load(Ordering::Relaxed) {
+        if stop_flag.load(Ordering::Acquire) {
             return false;
         }
 
-        packets_seen += 1;
+        packets_seen = packets_seen.wrapping_add(1);
 
         let mut parsed = match protocol::parse_packet(packet_data.data, link_type) {
             Some(p) => p,
@@ -482,7 +482,7 @@ fn run_tui_mode(
         };
 
         source.for_each_packet(|packet_data| {
-            if capture_stop.load(Ordering::Relaxed) {
+            if capture_stop.load(Ordering::Acquire) {
                 return false;
             }
 
@@ -604,11 +604,16 @@ fn run_tui_mode(
     let result = tui::run_tui(rx, packets_seen, stop_flag.clone());
 
     // Ensure capture thread stops
-    stop_flag.store(true, Ordering::Relaxed);
+    stop_flag.store(true, Ordering::Release);
     match capture_thread.join() {
-        Ok(Err(e)) => {
-            // TUI exited cleanly but capture had an error — report it
-            result.and(Err(e))
+        Ok(Err(capture_err)) => {
+            // TUI exited cleanly but capture had an error — chain it
+            match result {
+                Ok(()) => Err(capture_err),
+                Err(tui_err) => {
+                    Err(tui_err.context(format!("capture thread also failed: {capture_err}")))
+                }
+            }
         }
         // M5: Handle thread panic — extract message for debuggability
         Err(e) => {

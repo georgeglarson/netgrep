@@ -123,6 +123,11 @@ fn find_next_http_start(data: &[u8]) -> Option<usize> {
     const METHOD_T: &[&str] = &["TRACE"];
 
     for i in 0..data.len() {
+        // Issue #5: Only match at line boundaries to avoid false positives
+        // within response bodies (e.g., "HTTP/1.1" inside HTML/JSON).
+        if i > 0 && data[i - 1] != b'\n' {
+            continue;
+        }
         let remaining = &data[i..];
         match remaining[0] {
             b'H' => {
@@ -329,6 +334,11 @@ fn decode_chunked(data: &[u8]) -> Option<(Vec<u8>, usize)> {
 
     loop {
         let line_end = find_crlf(&data[pos..])?;
+        // L6: Reject unreasonably long chunk-size lines (max 100 chars
+        // covers any valid hex size + extensions)
+        if line_end > 100 {
+            return None;
+        }
         let size_line = &data[pos..pos + line_end];
 
         // Chunk size line is ASCII — parse as string
@@ -341,6 +351,8 @@ fn decode_chunked(data: &[u8]) -> Option<(Vec<u8>, usize)> {
         if chunk_size == 0 {
             // L19: Consume trailer headers after zero-size chunk
             // Trailers are header lines terminated by a final CRLF
+            let mut trailer_count = 0u32;
+            const MAX_TRAILERS: u32 = 100;
             while let Some(line_end) = find_crlf(&data[pos..]) {
                 pos += line_end + 2;
                 if line_end == 0 {
@@ -348,6 +360,10 @@ fn decode_chunked(data: &[u8]) -> Option<(Vec<u8>, usize)> {
                     break;
                 }
                 // Non-empty line — trailer header, continue
+                trailer_count += 1;
+                if trailer_count >= MAX_TRAILERS {
+                    break;
+                }
             }
             break;
         }
@@ -551,24 +567,26 @@ mod tests {
     // --- Phase 5 tests ---
 
     // H1: Close-delimited response followed by another message
+    // Issue #5: find_next_http_start requires line boundary to avoid false splits
     #[test]
     fn close_delimited_response_followed_by_request() {
-        let data = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody hereGET /next HTTP/1.1\r\nHost: b\r\n\r\n";
+        let data = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody here\nGET /next HTTP/1.1\r\nHost: b\r\n\r\n";
         let msgs = parse_http(data);
-        // Should find 2 messages: the response (body up to GET) and the request
+        // Should find 2 messages: the response (body up to \nGET) and the request
         assert_eq!(msgs.len(), 2);
         assert!(matches!(&msgs[0].kind, HttpKind::Response { .. }));
-        assert_eq!(msgs[0].body, "body here");
+        assert_eq!(msgs[0].body, "body here\n");
         assert!(matches!(&msgs[1].kind, HttpKind::Request { .. }));
     }
 
     // H1: Close-delimited response followed by another response
+    // Issue #5: find_next_http_start requires line boundary to avoid false splits
     #[test]
     fn close_delimited_response_then_response() {
-        let data = b"HTTP/1.1 200 OK\r\n\r\nfirst bodyHTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found";
+        let data = b"HTTP/1.1 200 OK\r\n\r\nfirst body\nHTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nnot found";
         let msgs = parse_http(data);
         assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].body, "first body");
+        assert_eq!(msgs[0].body, "first body\n");
         match &msgs[1].kind {
             HttpKind::Response { status, .. } => assert_eq!(*status, 404),
             _ => panic!("Expected response"),

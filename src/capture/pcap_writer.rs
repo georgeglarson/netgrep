@@ -39,7 +39,7 @@ impl<W: Write> PcapWriter<W> {
         record.extend_from_slice(&ts_usec.to_ne_bytes());
         record.extend_from_slice(&len.to_ne_bytes()); // incl_len
         record.extend_from_slice(&len.to_ne_bytes()); // orig_len
-        record.extend_from_slice(data);
+        record.extend_from_slice(&data[..len as usize]);
         self.writer.write_all(&record)?;
         Ok(())
     }

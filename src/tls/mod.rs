@@ -108,7 +108,7 @@ impl Drop for TlsConnection {
     }
 }
 
-// 5,000 connections * ~1.5 MB (buffers + decrypted) = ~7.5 GB worst case
+// 5,000 connections * ~1.6 MB (buffers + decrypted + handshake) = ~8 GB worst case
 const MAX_CONNECTIONS: usize = 5_000;
 const MAX_DECRYPTED_BYTES: usize = 1_048_576; // 1 MB per connection
 const MAX_BUFFER_BYTES: usize = 262_144; // 256 KB per direction buffer
@@ -142,7 +142,7 @@ impl TlsDecryptor {
             return;
         }
 
-        self.tick += 1;
+        self.tick = self.tick.saturating_add(1);
 
         // Evict least-recently-active connection if at capacity for a new one
         if !self.connections.contains_key(key) && self.connections.len() >= MAX_CONNECTIONS {
@@ -303,6 +303,14 @@ impl TlsDecryptor {
                     // Accumulate data until we have the full message.
                     self.accumulate_handshake(key, record.data, from_client, src_ip, src_port);
                 }
+                // Encrypted Alert records must be decrypted to advance sequence
+                // counters, otherwise all subsequent decryption fails (wrong nonce).
+                TlsRecordType::Alert if cipher_active => {
+                    if let Some(mut plaintext) = self.decrypt_record(key, &record, src_ip, src_port)
+                    {
+                        plaintext.zeroize();
+                    }
+                }
                 // After CCS, handshake records (Finished) are encrypted — decrypt to advance seq
                 TlsRecordType::Handshake | TlsRecordType::ApplicationData => {
                     if let Some(mut plaintext) = self.decrypt_record(key, &record, src_ip, src_port)
@@ -326,7 +334,7 @@ impl TlsDecryptor {
             offset += 5 + record_body_len;
         }
 
-        // Put remaining unparsed bytes back
+        // Put remaining unparsed bytes back, zeroize consumed portion
         if let Some(conn) = self.connections.get_mut(key) {
             let leftover = buffer[offset..].to_vec();
             if from_client {
@@ -335,6 +343,9 @@ impl TlsDecryptor {
                 conn.from_server_buf = leftover;
             }
         }
+        // Zeroize the taken buffer — it may contain TLS record data
+        let mut buffer = buffer;
+        buffer.zeroize();
     }
 
     /// M8: Accumulate handshake record data and dispatch complete messages.
@@ -411,6 +422,9 @@ impl TlsDecryptor {
             };
 
             self.process_handshake(key, &complete_msg, src_ip, src_port);
+            // Zeroize the extracted handshake message — it may contain key material
+            let mut complete_msg = complete_msg;
+            complete_msg.zeroize();
         }
     }
 
@@ -421,10 +435,12 @@ impl TlsDecryptor {
             None => return,
         };
 
-        let conn = self
-            .connections
-            .entry(key.clone())
-            .or_insert_with(TlsConnection::new);
+        // Issue #9: Use get_mut instead of entry().or_insert_with() to avoid
+        // recreating a connection that was removed (e.g., due to buffer overflow).
+        let conn = match self.connections.get_mut(key) {
+            Some(c) => c,
+            None => return,
+        };
 
         if let Some(cr) = result.client_random {
             conn.client_random = Some(cr);

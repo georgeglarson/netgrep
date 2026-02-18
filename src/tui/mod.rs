@@ -167,24 +167,44 @@ pub fn run_tui(
         // Poll for keyboard input (50ms timeout)
         if crossterm::event::poll(std::time::Duration::from_millis(50))?
             && let crossterm::event::Event::Key(key) = crossterm::event::read()?
+            && key.kind == crossterm::event::KeyEventKind::Press
             && handle_key(&mut app, key, &stop_flag)
         {
             break;
         }
 
-        // Drain all pending events from channel
+        // Drain pending events from channel (capped to keep UI responsive)
         let auto_select = app.events.is_empty();
-        while let Ok(event) = rx.try_recv() {
-            let event_bytes = event.approx_bytes();
-            if app.events.len() < MAX_TUI_EVENTS
-                && app.events_bytes.saturating_add(event_bytes) <= MAX_TUI_BYTES
-            {
-                app.events_bytes += event_bytes;
-                app.events.push(event);
-            } else {
-                // M22: Track dropped events
-                app.dropped_events += 1;
+        let mut drained = 0u32;
+        let mut disconnected = false;
+        loop {
+            if drained >= 1_000 {
+                break;
             }
+            match rx.try_recv() {
+                Ok(event) => {
+                    drained += 1;
+                    let event_bytes = event.approx_bytes();
+                    if app.events.len() < MAX_TUI_EVENTS
+                        && app.events_bytes.saturating_add(event_bytes) <= MAX_TUI_BYTES
+                    {
+                        app.events_bytes += event_bytes;
+                        app.events.push(event);
+                    } else {
+                        // M22: Track dropped events
+                        app.dropped_events += 1;
+                    }
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => break,
+                // L12: Detect channel disconnect (capture thread terminated)
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            app.capture_running = false;
         }
 
         // Auto-select first event if we just got our first events
@@ -193,7 +213,7 @@ pub fn run_tui(
         }
 
         // Check if capture thread has stopped
-        if stop_flag.load(Ordering::Relaxed) {
+        if stop_flag.load(Ordering::Acquire) {
             app.capture_running = false;
         }
 
@@ -237,7 +257,7 @@ fn render(frame: &mut ratatui::Frame, app: &mut AppState) {
                 Cell::from(ev.summary.proto.as_str()),
                 Cell::from(ev.summary.src.as_str()),
                 Cell::from(ev.summary.dst.as_str()),
-                Cell::from(ev.summary.info.as_str()),
+                Cell::from(crate::sanitize::sanitize_control_chars(&ev.summary.info)),
             ];
             Row::new(cells)
         })
@@ -284,8 +304,9 @@ fn render(frame: &mut ratatui::Frame, app: &mut AppState) {
 
     let detail_text = match app.selected_event() {
         Some(ev) => {
+            let sanitized_header = crate::sanitize::sanitize_control_chars(&ev.detail.header());
             let mut lines = vec![Line::from(Span::styled(
-                ev.detail.header(),
+                sanitized_header,
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
@@ -353,13 +374,13 @@ fn handle_key(
 
     // Ctrl+C always quits
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        stop_flag.store(true, Ordering::Relaxed);
+        stop_flag.store(true, Ordering::Release);
         return true;
     }
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => {
-            stop_flag.store(true, Ordering::Relaxed);
+            stop_flag.store(true, Ordering::Release);
             true
         }
         KeyCode::Char('j') | KeyCode::Down => {

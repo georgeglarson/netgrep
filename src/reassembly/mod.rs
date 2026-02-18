@@ -221,6 +221,13 @@ impl DirectionBuffer {
             };
             self.emitted_offset = 0;
             self.truncated = false;
+            // Prune stale reorder_buf entries that are behind next_seq.
+            // These are retransmissions that arrived out-of-order after
+            // the in-order stream already advanced past them.
+            if let Some(expected) = self.next_seq {
+                self.reorder_buf
+                    .retain(|&seq, _| (seq.wrapping_sub(expected) as i32) >= 0);
+            }
             Some(new_data)
         } else {
             None
@@ -345,7 +352,7 @@ impl StreamTable {
     /// to match against (on PSH or when the stream closes via FIN/RST).
     /// RST emits both directions (forward and reverse) if they have unemitted data.
     pub fn process(&mut self, packet: &ParsedPacket) -> Vec<StreamData> {
-        self.tick += 1;
+        self.tick = self.tick.saturating_add(1);
 
         // M17: Periodically sweep stale streams to prevent memory leaks
         // from connections that never close cleanly.
