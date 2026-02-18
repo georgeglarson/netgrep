@@ -9,6 +9,8 @@ use ring::aead;
 use ring::hkdf;
 use tls_parser::*;
 
+use zeroize::Zeroize;
+
 use crate::protocol::StreamKey;
 use decrypt::DirectionKeys;
 use keylog::KeyLog;
@@ -34,9 +36,8 @@ struct TlsConnection {
     client_cipher_active: bool,
     server_cipher_active: bool,
     /// Accumulated decrypted plaintext from both directions.
+    /// L3: Cleared atomically via std::mem::take in get_decrypted().
     decrypted: Vec<u8>,
-    /// Byte offset up to which decrypted data has been returned to the caller.
-    decrypted_emitted: usize,
     /// Monotonic tick updated on each packet for LRU eviction.
     last_active: u64,
     /// IV length from cipher suite (4 for AES-GCM, 12 for ChaCha20/TLS 1.3).
@@ -60,7 +61,6 @@ impl TlsConnection {
             client_cipher_active: false,
             server_cipher_active: false,
             decrypted: Vec::new(),
-            decrypted_emitted: 0,
             last_active: 0,
             iv_len: 4,
         }
@@ -72,6 +72,15 @@ impl TlsConnection {
             // Before ClientHello is seen, treat first sender as client
             None => true,
         }
+    }
+}
+
+impl Drop for TlsConnection {
+    fn drop(&mut self) {
+        // M3: Zeroize sensitive buffers that may contain TLS record data
+        self.from_client_buf.zeroize();
+        self.from_server_buf.zeroize();
+        self.decrypted.zeroize();
     }
 }
 
@@ -152,21 +161,20 @@ impl TlsDecryptor {
 
     /// Get new decrypted plaintext since the last call for a connection.
     /// Returns None if no new decrypted data is available.
-    /// Drains emitted bytes from the buffer to free memory (M20).
+    /// L3: Uses std::mem::take to atomically swap and clear the buffer,
+    /// avoiding the previous offset tracking + drain pattern.
     pub fn get_decrypted(&mut self, key: &StreamKey) -> Option<Vec<u8>> {
         let conn = self.connections.get_mut(key)?;
-        if conn.decrypted_emitted >= conn.decrypted.len() {
+        if conn.decrypted.is_empty() {
             None
         } else {
-            let new_data = conn.decrypted[conn.decrypted_emitted..].to_vec();
-            // Drain emitted bytes to free memory
-            conn.decrypted.drain(..conn.decrypted.len());
-            conn.decrypted_emitted = 0;
-            Some(new_data)
+            Some(std::mem::take(&mut conn.decrypted))
         }
     }
 
-    /// Remove a connection's TLS state (M19). Call on FIN/RST.
+    /// Remove a connection's TLS state. Call on FIN/RST.
+    /// L4: Currently unused — intended for future integration where the
+    /// capture loop explicitly cleans up TLS state on connection close.
     #[allow(dead_code)]
     pub fn remove_connection(&mut self, key: &StreamKey) {
         self.connections.remove(key);
@@ -429,19 +437,25 @@ impl TlsDecryptor {
         aead_algo: &'static aead::Algorithm,
         hmac_algo: ring::hmac::Algorithm,
     ) {
-        let master_secret = match self.keylog.master_secrets.get(client_random) {
+        let mut master_secret = match self.keylog.master_secrets.get(client_random) {
             Some(ms) => ms.clone(),
             None => return,
         };
 
         let conn = match self.connections.get_mut(key) {
             Some(c) => c,
-            None => return,
+            None => {
+                master_secret.zeroize();
+                return;
+            }
         };
 
         let server_random = match conn.server_random {
             Some(sr) => sr,
-            None => return,
+            None => {
+                master_secret.zeroize();
+                return;
+            }
         };
 
         if let Ok((client_keys, server_keys)) = decrypt::derive_tls12_keys(
@@ -456,8 +470,17 @@ impl TlsDecryptor {
             conn.client_keys = Some(client_keys);
             conn.server_keys = Some(server_keys);
         }
+        master_secret.zeroize();
     }
 
+    /// Attempt to decrypt a single TLS record.
+    ///
+    /// M4: If a record is entirely skipped (e.g., buffer truncation in
+    /// `drain_buffer` or an unrecognized record type), the per-direction
+    /// sequence number won't be incremented, causing all subsequent
+    /// decryption attempts for that direction to fail (wrong nonce).
+    /// This is a known limitation — accurate record-level parsing is
+    /// required for TLS decryption to work.
     fn decrypt_record(
         &mut self,
         key: &StreamKey,
@@ -490,11 +513,16 @@ impl TlsDecryptor {
     ) -> Option<Vec<u8>> {
         let record_len = record.hdr.len;
 
-        // Build AAD (same for all attempts)
-        let mut aad = Vec::with_capacity(5);
-        aad.push(record.hdr.record_type.0);
-        aad.extend_from_slice(&u16::from(record.hdr.version).to_be_bytes());
-        aad.extend_from_slice(&record_len.to_be_bytes());
+        // L5: Build AAD on the stack to avoid per-record heap allocation.
+        let version_bytes = u16::from(record.hdr.version).to_be_bytes();
+        let len_bytes = record_len.to_be_bytes();
+        let aad: [u8; 5] = [
+            record.hdr.record_type.0,
+            version_bytes[0],
+            version_bytes[1],
+            len_bytes[0],
+            len_bytes[1],
+        ];
 
         let conn = self.connections.get_mut(key)?;
 
@@ -589,13 +617,26 @@ impl TlsDecryptor {
             }
             let explicit_nonce: Vec<u8> = ciphertext.drain(..8).collect();
 
-            // AAD: seq_num(8) + type(1) + version(2) + plaintext_length(2)
+            // L5: AAD on the stack: seq_num(8) + type(1) + version(2) + plaintext_length(2)
             let plaintext_len = ciphertext.len() - 16; // minus tag (safe: checked >= 24 above)
-            let mut aad = Vec::with_capacity(13);
-            aad.extend_from_slice(&(keys.seq_num()).to_be_bytes());
-            aad.push(record.hdr.record_type.0);
-            aad.extend_from_slice(&u16::from(record.hdr.version).to_be_bytes());
-            aad.extend_from_slice(&u16::try_from(plaintext_len).ok()?.to_be_bytes());
+            let pt_len_bytes = u16::try_from(plaintext_len).ok()?.to_be_bytes();
+            let seq_bytes = keys.seq_num().to_be_bytes();
+            let ver_bytes = u16::from(record.hdr.version).to_be_bytes();
+            let aad: [u8; 13] = [
+                seq_bytes[0],
+                seq_bytes[1],
+                seq_bytes[2],
+                seq_bytes[3],
+                seq_bytes[4],
+                seq_bytes[5],
+                seq_bytes[6],
+                seq_bytes[7],
+                record.hdr.record_type.0,
+                ver_bytes[0],
+                ver_bytes[1],
+                pt_len_bytes[0],
+                pt_len_bytes[1],
+            ];
 
             keys.decrypt_tls12_record(&mut ciphertext, &aad, &explicit_nonce)
                 .ok()
@@ -606,13 +647,26 @@ impl TlsDecryptor {
                 return None;
             }
 
-            // AAD: seq_num(8) + type(1) + version(2) + plaintext_length(2)
+            // L5: AAD on the stack: seq_num(8) + type(1) + version(2) + plaintext_length(2)
             let plaintext_len = ciphertext.len() - 16;
-            let mut aad = Vec::with_capacity(13);
-            aad.extend_from_slice(&(keys.seq_num()).to_be_bytes());
-            aad.push(record.hdr.record_type.0);
-            aad.extend_from_slice(&u16::from(record.hdr.version).to_be_bytes());
-            aad.extend_from_slice(&u16::try_from(plaintext_len).ok()?.to_be_bytes());
+            let pt_len_bytes = u16::try_from(plaintext_len).ok()?.to_be_bytes();
+            let seq_bytes = keys.seq_num().to_be_bytes();
+            let ver_bytes = u16::from(record.hdr.version).to_be_bytes();
+            let aad: [u8; 13] = [
+                seq_bytes[0],
+                seq_bytes[1],
+                seq_bytes[2],
+                seq_bytes[3],
+                seq_bytes[4],
+                seq_bytes[5],
+                seq_bytes[6],
+                seq_bytes[7],
+                record.hdr.record_type.0,
+                ver_bytes[0],
+                ver_bytes[1],
+                pt_len_bytes[0],
+                pt_len_bytes[1],
+            ];
 
             // Use build_nonce (XOR seq with full 12-byte IV) via decrypt_record
             keys.decrypt_record(&mut ciphertext, &aad).ok()
@@ -684,7 +738,6 @@ mod tests {
         decryptor.process_packet(&key, &[0xFF], src_ip, 12345);
         let conn = decryptor.connections.get_mut(&key).unwrap();
         conn.decrypted = vec![0xAA; MAX_DECRYPTED_BYTES];
-        conn.decrypted_emitted = 0;
 
         // get_decrypted should return the full buffer
         let data = decryptor.get_decrypted(&key).unwrap();

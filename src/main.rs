@@ -122,7 +122,13 @@ fn main() -> Result<()> {
             } else {
                 p.clone()
             };
-            Some(Regex::new(&pat)?)
+            // M11: Limit compiled regex size to prevent ReDoS via
+            // pathological patterns that cause exponential memory usage.
+            Some(
+                regex::bytes::RegexBuilder::new(&pat)
+                    .size_limit(10 * 1024 * 1024)
+                    .build()?,
+            )
         }
         None => None,
     };
@@ -194,7 +200,10 @@ fn main() -> Result<()> {
         let stop_clone = stop_flag.clone();
         if let Err(e) = ctrlc::set_handler(move || {
             if stop_clone.load(Ordering::Relaxed) {
-                // Second Ctrl+C — force exit
+                // Second Ctrl+C — force exit.
+                // M10: process::exit bypasses Drop impls, so pcap writers won't
+                // flush and TLS key material won't be zeroized. Acceptable because
+                // the user is explicitly requesting immediate termination.
                 std::process::exit(1);
             }
             stop_clone.store(true, Ordering::Relaxed);
@@ -300,6 +309,9 @@ fn run_cli_mode(
         None => None,
     };
 
+    // L9: Import once for all flush() calls below.
+    use std::io::Write as _;
+
     source.for_each_packet(|packet_data| {
         if stop_flag.load(Ordering::Relaxed) {
             return false;
@@ -315,93 +327,91 @@ fn run_cli_mode(
 
         if !cli.no_reassemble && parsed.is_tcp() {
             for stream_data in stream_table.process(&parsed) {
-                // Feed TLS decryptor with deduped, in-order stream data
-                if let Some(key) = parsed.stream_key() {
-                    let (src_ip, src_port) = stream_data.src_addr;
-                    feed_tls_stream(&key, &stream_data.payload, src_ip, src_port, tls_decryptor);
+                // Use stream_data.key (not parsed.stream_key()) so evicted
+                // streams get the correct key for TLS/H2 processing.
+                let (src_ip, src_port) = stream_data.src_addr;
+                feed_tls_stream(
+                    &stream_data.key,
+                    &stream_data.payload,
+                    src_ip,
+                    src_port,
+                    tls_decryptor,
+                );
 
-                    let effective_payload =
-                        resolve_tls_payload(&key, tls_decryptor, &stream_data.payload);
+                let effective_payload =
+                    resolve_tls_payload(&stream_data.key, tls_decryptor, &stream_data.payload);
 
-                    // Try HTTP/2 parsing if in http mode
-                    let h2_messages = if let Some(ref mut h2) = h2_tracker {
-                        let h2_dir = match stream_data.direction {
-                            reassembly::Direction::Forward => {
-                                protocol::http2::H2Direction::ClientToServer
-                            }
-                            reassembly::Direction::Reverse => {
-                                protocol::http2::H2Direction::ServerToClient
-                            }
-                        };
-                        h2.process(&key, &effective_payload, h2_dir)
-                    } else {
-                        vec![]
+                // Try HTTP/2 parsing if in http mode
+                let h2_messages = if let Some(ref mut h2) = h2_tracker {
+                    let h2_dir = match stream_data.direction {
+                        reassembly::Direction::Forward => {
+                            protocol::http2::H2Direction::ClientToServer
+                        }
+                        reassembly::Direction::Reverse => {
+                            protocol::http2::H2Direction::ServerToClient
+                        }
                     };
+                    h2.process(&stream_data.key, &effective_payload, h2_dir)
+                } else {
+                    vec![]
+                };
 
-                    if !h2_messages.is_empty() {
-                        // HTTP/2 messages found — match and display individually
-                        let stream_id = key.to_string();
-                        for msg in &h2_messages {
-                            // M2: Check count limit inside H2 message loop
-                            if let Some(n) = cli.count
-                                && match_count >= n
-                            {
-                                break;
-                            }
-                            let display = msg.display_string();
-                            if is_match(display.as_bytes(), pattern, cli.invert) {
-                                if cli.json {
-                                    formatter.print_http_json(&stream_id, msg);
-                                } else {
-                                    formatter.print_http_text(&stream_id, msg, pattern);
-                                }
-                                if line_buffered {
-                                    use std::io::Write;
-                                    let _ = std::io::stdout().flush();
-                                }
-                                if let Some(ref mut writer) = pcap_writer
-                                    && let Err(e) =
-                                        writer.write_packet(packet_data.data, packet_data.timestamp)
-                                {
-                                    eprintln!(
-                                        "Warning: failed to write packet to output file: {}",
-                                        e
-                                    );
-                                }
-                                match_count += 1;
-                            }
-                        }
-                    } else if is_match(&effective_payload, pattern, cli.invert) {
-                        let display_data = reassembly::StreamData {
-                            key: stream_data.key,
-                            payload: effective_payload,
-                            direction: stream_data.direction,
-                            src_addr: stream_data.src_addr,
-                        };
-                        formatter.print_stream(&display_data, pattern);
-                        if line_buffered {
-                            use std::io::Write;
-                            let _ = std::io::stdout().flush();
-                        }
-                        if let Some(ref mut writer) = pcap_writer
-                            && let Err(e) =
-                                writer.write_packet(packet_data.data, packet_data.timestamp)
+                if !h2_messages.is_empty() {
+                    // HTTP/2 messages found — match and display individually
+                    let stream_id = stream_data.key.to_string();
+                    for msg in &h2_messages {
+                        // M2: Check count limit inside H2 message loop
+                        if let Some(n) = cli.count
+                            && match_count >= n
                         {
-                            eprintln!("Warning: failed to write packet to output file: {}", e);
+                            break;
                         }
-                        match_count += 1;
+                        let display = msg.display_string();
+                        if is_match(display.as_bytes(), pattern, cli.invert) {
+                            if cli.json {
+                                formatter.print_http_json(&stream_id, msg);
+                            } else {
+                                formatter.print_http_text(&stream_id, msg, pattern);
+                            }
+                            if line_buffered {
+                                let _ = std::io::stdout().flush();
+                            }
+                            if let Some(ref mut writer) = pcap_writer
+                                && let Err(e) =
+                                    writer.write_packet(packet_data.data, packet_data.timestamp)
+                            {
+                                eprintln!("Warning: failed to write packet to output file: {}", e);
+                            }
+                            match_count += 1;
+                        }
                     }
+                } else if is_match(&effective_payload, pattern, cli.invert) {
+                    let display_data = reassembly::StreamData {
+                        key: stream_data.key,
+                        payload: effective_payload,
+                        direction: stream_data.direction,
+                        src_addr: stream_data.src_addr,
+                    };
+                    formatter.print_stream(&display_data, pattern);
+                    if line_buffered {
+                        let _ = std::io::stdout().flush();
+                    }
+                    if let Some(ref mut writer) = pcap_writer
+                        && let Err(e) = writer.write_packet(packet_data.data, packet_data.timestamp)
+                    {
+                        eprintln!("Warning: failed to write packet to output file: {}", e);
+                    }
+                    match_count += 1;
                 }
             }
         } else {
             // M4: Skip TLS resolution in no-reassemble path — TLS decryption
             // requires reassembled stream data and won't work per-packet.
-            let payload = parsed.payload.clone();
-            let match_text = build_match_text(&payload, &parsed, cli.dns);
+            // L10: Use &parsed.payload directly instead of cloning.
+            let match_text = build_match_text(&parsed.payload, &parsed, cli.dns);
             if is_match(&match_text, pattern, cli.invert) {
                 formatter.print_packet(&parsed, pattern);
                 if line_buffered {
-                    use std::io::Write;
                     let _ = std::io::stdout().flush();
                 }
                 if let Some(ref mut writer) = pcap_writer
@@ -425,6 +435,11 @@ fn run_cli_mode(
     Ok(())
 }
 
+// M12: The CLI and TUI capture loops share structural similarities (stream
+// reassembly, TLS decryption, HTTP/2 parsing, pattern matching) but differ in
+// output handling (stdout vs channel events). A shared capture-loop function
+// parameterized by an output sink would reduce duplication — left as a future
+// refactoring opportunity to avoid destabilizing the capture paths.
 fn run_tui_mode(
     cli: &Cli,
     mut source: PacketSource,
@@ -470,82 +485,84 @@ fn run_tui_mode(
 
             if reassemble && parsed.is_tcp() {
                 for stream_data in stream_table.process(&parsed) {
-                    // Feed TLS with deduped data
-                    if let Some(key) = parsed.stream_key() {
-                        let (src_ip, src_port) = stream_data.src_addr;
-                        feed_tls_stream(
-                            &key,
-                            &stream_data.payload,
-                            src_ip,
-                            src_port,
-                            &mut tls_decryptor,
-                        );
-                        let effective_payload =
-                            resolve_tls_payload(&key, &mut tls_decryptor, &stream_data.payload);
+                    // Use stream_data.key (not parsed.stream_key()) so evicted
+                    // streams get the correct key for TLS/H2 processing.
+                    let (src_ip, src_port) = stream_data.src_addr;
+                    feed_tls_stream(
+                        &stream_data.key,
+                        &stream_data.payload,
+                        src_ip,
+                        src_port,
+                        &mut tls_decryptor,
+                    );
+                    let effective_payload = resolve_tls_payload(
+                        &stream_data.key,
+                        &mut tls_decryptor,
+                        &stream_data.payload,
+                    );
 
-                        // Try HTTP/2 parsing
-                        let h2_messages = if let Some(ref mut h2) = h2_tracker {
-                            let h2_dir = match stream_data.direction {
-                                reassembly::Direction::Forward => {
-                                    protocol::http2::H2Direction::ClientToServer
-                                }
-                                reassembly::Direction::Reverse => {
-                                    protocol::http2::H2Direction::ServerToClient
-                                }
-                            };
-                            h2.process(&key, &effective_payload, h2_dir)
-                        } else {
-                            vec![]
+                    // Try HTTP/2 parsing
+                    let h2_messages = if let Some(ref mut h2) = h2_tracker {
+                        let h2_dir = match stream_data.direction {
+                            reassembly::Direction::Forward => {
+                                protocol::http2::H2Direction::ClientToServer
+                            }
+                            reassembly::Direction::Reverse => {
+                                protocol::http2::H2Direction::ServerToClient
+                            }
                         };
+                        h2.process(&stream_data.key, &effective_payload, h2_dir)
+                    } else {
+                        vec![]
+                    };
 
-                        if !h2_messages.is_empty() {
-                            // HTTP/2 messages — match against display text
-                            for msg in &h2_messages {
-                                // M3: Check count limit inside H2 message loop
-                                if let Some(n) = count_limit
-                                    && match_count >= n
-                                {
-                                    break;
-                                }
-                                let display = msg.display_string();
-                                if is_match(display.as_bytes(), &pattern, invert) {
-                                    event_id += 1;
-                                    let event = tui::event::CaptureEvent::from_h2_messages(
-                                        event_id,
-                                        &key,
-                                        std::slice::from_ref(msg),
-                                    );
-                                    if tx.send(event).is_err() {
-                                        return false;
-                                    }
-                                    match_count += 1;
-                                }
+                    if !h2_messages.is_empty() {
+                        // HTTP/2 messages — match against display text
+                        for msg in &h2_messages {
+                            // M3: Check count limit inside H2 message loop
+                            if let Some(n) = count_limit
+                                && match_count >= n
+                            {
+                                break;
                             }
-                        } else if is_match(&effective_payload, &pattern, invert) {
-                            event_id += 1;
-                            let display_data = reassembly::StreamData {
-                                key: stream_data.key,
-                                payload: effective_payload,
-                                direction: stream_data.direction,
-                                src_addr: stream_data.src_addr,
-                            };
-                            let event = tui::event::CaptureEvent::from_stream(
-                                event_id,
-                                &display_data,
-                                http_mode,
-                            );
-                            if tx.send(event).is_err() {
-                                return false;
+                            let display = msg.display_string();
+                            if is_match(display.as_bytes(), &pattern, invert) {
+                                event_id += 1;
+                                let event = tui::event::CaptureEvent::from_h2_messages(
+                                    event_id,
+                                    &stream_data.key,
+                                    std::slice::from_ref(msg),
+                                );
+                                if tx.send(event).is_err() {
+                                    return false;
+                                }
+                                match_count += 1;
                             }
-                            match_count += 1;
                         }
+                    } else if is_match(&effective_payload, &pattern, invert) {
+                        event_id += 1;
+                        let display_data = reassembly::StreamData {
+                            key: stream_data.key,
+                            payload: effective_payload,
+                            direction: stream_data.direction,
+                            src_addr: stream_data.src_addr,
+                        };
+                        let event = tui::event::CaptureEvent::from_stream(
+                            event_id,
+                            &display_data,
+                            http_mode,
+                        );
+                        if tx.send(event).is_err() {
+                            return false;
+                        }
+                        match_count += 1;
                     }
                 }
             } else {
                 // M1/M2: Skip TLS resolution in no-reassemble path — TLS decryption
                 // requires reassembled stream data and won't work per-packet.
-                let payload = parsed.payload.clone();
-                let match_text = build_match_text(&payload, &parsed, dns_mode);
+                // L10: Use &parsed.payload directly instead of cloning.
+                let match_text = build_match_text(&parsed.payload, &parsed, dns_mode);
                 if is_match(&match_text, &pattern, invert) {
                     event_id += 1;
                     let event = tui::event::CaptureEvent::from_packet(event_id, &parsed, dns_mode);

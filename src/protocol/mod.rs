@@ -2,6 +2,8 @@ pub mod dns;
 pub mod http;
 pub mod http2;
 
+use std::borrow::Cow;
+
 use etherparse::{NetSlice, SlicedPacket, TransportSlice};
 use std::net::IpAddr;
 
@@ -83,8 +85,9 @@ impl ParsedPacket {
     }
 
     /// Return payload as a lossy UTF-8 string for display.
-    pub fn payload_str(&self) -> String {
-        String::from_utf8_lossy(&self.payload).into_owned()
+    /// L2: Returns Cow<str> to avoid allocation when payload is valid UTF-8.
+    pub fn payload_str(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.payload)
     }
 
     /// Connection tuple for stream tracking.

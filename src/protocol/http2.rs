@@ -26,6 +26,8 @@ const MAX_STREAMS_PER_CONN: usize = 1_000;
 const MAX_HEADER_BLOCK: usize = 65_536;
 const MAX_DATA_PER_STREAM: usize = 1_048_576; // 1 MB
 const MAX_CONNECTIONS: usize = 10_000;
+/// M1: Cap per-direction buffer to prevent unbounded memory growth.
+const MAX_DIRECTION_BUF: usize = 16 * 1024 * 1024; // 16 MB
 
 /// Direction of data flow within a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,6 +55,12 @@ struct H2Connection {
     detected: Option<bool>,
     /// Monotonic tick for LRU eviction.
     last_active: u64,
+    /// Accumulates header block fragments for discarded streams (rejected at
+    /// stream limit) or PUSH_PROMISE frames that span multiple CONTINUATION
+    /// frames. HPACK is stateful — every header block must be decoded even if
+    /// the headers are discarded, otherwise the dynamic table becomes corrupted.
+    /// Format: (stream_id, direction, accumulated_header_bytes).
+    discard_header_buf: Option<(u32, H2Direction, Vec<u8>)>,
 }
 
 struct H2Stream {
@@ -96,6 +104,7 @@ impl H2Connection {
             server_buf: Vec::new(),
             detected: None,
             last_active: 0,
+            discard_header_buf: None,
         }
     }
 }
@@ -152,6 +161,11 @@ impl H2Tracker {
             H2Direction::ClientToServer => &mut conn.client_buf,
             H2Direction::ServerToClient => &mut conn.server_buf,
         };
+        // M1: Cap per-direction buffer size to prevent unbounded growth
+        if buf.len() + payload.len() > MAX_DIRECTION_BUF {
+            buf.clear();
+            return vec![];
+        }
         buf.extend_from_slice(payload);
 
         // Check for HTTP/2 detection on either direction buffer (M14)
@@ -192,8 +206,10 @@ impl H2Tracker {
     }
 
     /// Parse complete HTTP/2 frames from the direction buffer, returning any completed messages.
+    /// M8: Uses a cursor offset instead of per-frame drain for O(n) total cost.
     fn drain_frames(conn: &mut H2Connection, direction: H2Direction) -> Vec<HttpMessage> {
         let mut messages = Vec::new();
+        let mut cursor = 0;
 
         loop {
             let buf = match direction {
@@ -201,50 +217,44 @@ impl H2Tracker {
                 H2Direction::ServerToClient => &conn.server_buf,
             };
 
+            let remaining = buf.len() - cursor;
+
             // Need at least 9 bytes for a frame header
-            if buf.len() < 9 {
+            if remaining < 9 {
                 break;
             }
 
             // Parse frame header
-            let payload_len =
-                ((buf[0] as usize) << 16) | ((buf[1] as usize) << 8) | (buf[2] as usize);
-            let frame_type = buf[3];
-            let flags = buf[4];
-            let stream_id = u32::from_be_bytes([buf[5] & 0x7F, buf[6], buf[7], buf[8]]);
+            let payload_len = ((buf[cursor] as usize) << 16)
+                | ((buf[cursor + 1] as usize) << 8)
+                | (buf[cursor + 2] as usize);
+            let frame_type = buf[cursor + 3];
+            let flags = buf[cursor + 4];
+            let stream_id = u32::from_be_bytes([
+                buf[cursor + 5] & 0x7F,
+                buf[cursor + 6],
+                buf[cursor + 7],
+                buf[cursor + 8],
+            ]);
 
             // Safety check on payload size
             if payload_len > MAX_FRAME_PAYLOAD {
-                // Malformed — clear buffer
-                match direction {
-                    H2Direction::ClientToServer => conn.client_buf.clear(),
-                    H2Direction::ServerToClient => conn.server_buf.clear(),
-                }
+                // Malformed — discard entire buffer
+                cursor = buf.len();
                 break;
             }
 
             // Check if we have the complete frame
             let total = 9 + payload_len;
-            let buf = match direction {
-                H2Direction::ClientToServer => &conn.client_buf,
-                H2Direction::ServerToClient => &conn.server_buf,
-            };
-            if buf.len() < total {
+            if remaining < total {
                 break;
             }
 
             // Extract frame payload
-            let frame_payload = buf[9..total].to_vec();
+            let frame_payload = buf[cursor + 9..cursor + total].to_vec();
 
-            // Advance buffer
-            match direction {
-                H2Direction::ClientToServer => {
-                    conn.client_buf.drain(..total);
-                }
-                H2Direction::ServerToClient => {
-                    conn.server_buf.drain(..total);
-                }
-            }
+            // Advance cursor past this frame
+            cursor += total;
 
             // Process frame by type
             match frame_type {
@@ -264,16 +274,22 @@ impl H2Tracker {
                     let header_block = parse_headers_payload(&frame_payload, flags);
 
                     if is_new && at_limit {
-                        // Must decode HPACK to maintain state, but discard result
+                        // Must decode HPACK to maintain state, but discard result.
                         if end_headers {
                             let decoder = match direction {
                                 H2Direction::ClientToServer => &mut conn.client_decoder,
                                 H2Direction::ServerToClient => &mut conn.server_decoder,
                             };
                             let _ = decoder.decode(header_block);
+                        } else {
+                            // No END_HEADERS — accumulate fragments for HPACK
+                            // decode when the final CONTINUATION arrives.
+                            let mut buf = Vec::new();
+                            if header_block.len() <= MAX_HEADER_BLOCK {
+                                buf.extend_from_slice(header_block);
+                            }
+                            conn.discard_header_buf = Some((stream_id, direction, buf));
                         }
-                        // No END_HEADERS: track for CONTINUATION decode
-                        // (handled by continuation frame checking streams map)
                         continue;
                     }
 
@@ -328,9 +344,27 @@ impl H2Tracker {
                             }
                         }
                     } else {
-                        // CONTINUATION for a discarded stream — must still decode
-                        // HPACK to keep state consistent
+                        // CONTINUATION for a discarded stream or PUSH_PROMISE —
+                        // accumulate fragments and decode HPACK when complete.
                         let end_headers = flags & FLAG_END_HEADERS != 0;
+                        if let Some((discard_sid, discard_dir, ref mut buf)) =
+                            conn.discard_header_buf
+                            && discard_sid == stream_id
+                        {
+                            if buf.len() + frame_payload.len() <= MAX_HEADER_BLOCK {
+                                buf.extend_from_slice(&frame_payload);
+                            }
+                            if end_headers {
+                                let decoder = match discard_dir {
+                                    H2Direction::ClientToServer => &mut conn.client_decoder,
+                                    H2Direction::ServerToClient => &mut conn.server_decoder,
+                                };
+                                let _ = decoder.decode(buf);
+                                conn.discard_header_buf = None;
+                            }
+                            continue;
+                        }
+                        // Standalone CONTINUATION without a tracked discard buffer
                         if end_headers {
                             let decoder = match direction {
                                 H2Direction::ClientToServer => &mut conn.client_decoder,
@@ -408,6 +442,14 @@ impl H2Tracker {
                             H2Direction::ServerToClient => &mut conn.server_decoder,
                         };
                         let _ = decoder.decode(header_block);
+                    } else {
+                        // No END_HEADERS — accumulate fragments for HPACK
+                        // decode when the final CONTINUATION arrives.
+                        let mut buf = Vec::new();
+                        if header_block.len() <= MAX_HEADER_BLOCK {
+                            buf.extend_from_slice(header_block);
+                        }
+                        conn.discard_header_buf = Some((stream_id, direction, buf));
                     }
                 }
                 FRAME_SETTINGS => {
@@ -416,6 +458,18 @@ impl H2Tracker {
                 _ => {
                     // PRIORITY, PING, GOAWAY, WINDOW_UPDATE —
                     // not needed for basic HTTP message extraction.
+                }
+            }
+        }
+
+        // M8: Single drain at the end — O(remaining) once, not per-frame
+        if cursor > 0 {
+            match direction {
+                H2Direction::ClientToServer => {
+                    conn.client_buf.drain(..cursor);
+                }
+                H2Direction::ServerToClient => {
+                    conn.server_buf.drain(..cursor);
                 }
             }
         }

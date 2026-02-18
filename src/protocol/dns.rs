@@ -41,6 +41,10 @@ pub fn strip_tcp_prefix(payload: &[u8], is_tcp: bool) -> &[u8] {
         if dns_len + 2 <= payload.len() {
             return &payload[2..2 + dns_len];
         }
+        // M5: Truncated TCP DNS — strip the length prefix even when the body
+        // is incomplete, so parse_dns attempts parsing what's available
+        // instead of choking on the 2-byte length prefix.
+        return &payload[2..];
     }
     payload
 }
@@ -194,8 +198,13 @@ pub fn rcode_str(code: u8) -> &'static str {
     }
 }
 
+/// L15: Maximum length for display_string output to prevent unbounded
+/// concatenation from large DNS responses (e.g. zone transfers).
+const MAX_DISPLAY_LEN: usize = 8192;
+
 impl DnsInfo {
     /// Format for regex matching — includes domain names, record data, etc.
+    /// L15: Capped at MAX_DISPLAY_LEN bytes to prevent excessive allocations.
     pub fn display_string(&self) -> String {
         let mut out = String::new();
 
@@ -204,20 +213,28 @@ impl DnsInfo {
             out.push(' ');
             out.push_str(&q.qtype);
             out.push(' ');
+            if out.len() >= MAX_DISPLAY_LEN {
+                break;
+            }
         }
 
-        for r in self
-            .answers
-            .iter()
-            .chain(&self.authorities)
-            .chain(&self.additionals)
-        {
-            out.push_str(&r.name);
-            out.push(' ');
-            out.push_str(&r.rtype);
-            out.push(' ');
-            out.push_str(&r.rdata);
-            out.push(' ');
+        if out.len() < MAX_DISPLAY_LEN {
+            for r in self
+                .answers
+                .iter()
+                .chain(&self.authorities)
+                .chain(&self.additionals)
+            {
+                out.push_str(&r.name);
+                out.push(' ');
+                out.push_str(&r.rtype);
+                out.push(' ');
+                out.push_str(&r.rdata);
+                out.push(' ');
+                if out.len() >= MAX_DISPLAY_LEN {
+                    break;
+                }
+            }
         }
 
         // Trim trailing space before rcode to avoid double-space

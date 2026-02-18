@@ -24,7 +24,9 @@ pub enum HttpKind {
 
 impl HttpMessage {
     /// Format for display: status line + headers + body.
+    /// L8: Uses write! to avoid intermediate format! allocations.
     pub fn display_string(&self) -> String {
+        use std::fmt::Write;
         let mut out = String::new();
 
         match &self.kind {
@@ -33,19 +35,19 @@ impl HttpMessage {
                 uri,
                 version,
             } => {
-                out.push_str(&format!("{} {} {}\r\n", method, uri, version));
+                let _ = write!(out, "{} {} {}\r\n", method, uri, version);
             }
             HttpKind::Response {
                 version,
                 status,
                 reason,
             } => {
-                out.push_str(&format!("{} {} {}\r\n", version, status, reason));
+                let _ = write!(out, "{} {} {}\r\n", version, status, reason);
             }
         }
 
         for (k, v) in &self.headers {
-            out.push_str(&format!("{}: {}\r\n", k, v));
+            let _ = write!(out, "{}: {}\r\n", k, v);
         }
 
         out.push_str("\r\n");
@@ -86,18 +88,38 @@ const MAX_CHUNKED_BODY: usize = 10 * 1024 * 1024;
 
 /// H1: Find the start of the next HTTP message in a byte slice.
 /// Looks for request methods and "HTTP/" response starts.
+/// M7: Uses first-byte filtering to avoid O(n*m) scanning.
+/// M6: Requires full "HTTP/x.y NNN" pattern for response starts to reduce
+/// false splits in close-delimited response bodies.
 fn find_next_http_start(data: &[u8]) -> Option<usize> {
     for i in 0..data.len() {
-        if data[i..].starts_with(b"HTTP/") {
-            return Some(i);
-        }
-        for method in KNOWN_METHODS {
-            if data[i..].starts_with(method.as_bytes()) {
-                let after = i + method.len();
-                if after < data.len() && data[after] == b' ' {
+        // M7: Filter by first byte before attempting starts_with comparisons
+        match data[i] {
+            b'H' => {
+                // M6: Require "HTTP/" followed by digit.digit space digit
+                // to avoid false-matching "HTTP/" in body content.
+                if data.len() >= i + 10
+                    && data[i..].starts_with(b"HTTP/")
+                    && data[i + 5].is_ascii_digit()
+                    && data[i + 6] == b'.'
+                    && data[i + 7].is_ascii_digit()
+                    && data[i + 8] == b' '
+                    && data[i + 9].is_ascii_digit()
+                {
                     return Some(i);
                 }
             }
+            b'G' | b'P' | b'D' | b'C' | b'O' | b'T' => {
+                for method in KNOWN_METHODS {
+                    if data[i..].starts_with(method.as_bytes()) {
+                        let after = i + method.len();
+                        if after < data.len() && data[after] == b' ' {
+                            return Some(i);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     None

@@ -1,3 +1,4 @@
+use base64::Engine;
 use colored::Colorize;
 use regex::bytes::Regex;
 use serde_json::json;
@@ -220,6 +221,9 @@ impl Formatter {
                 );
             }
         }
+        // L12: DNS body is built from structured fields (not raw payload), so it
+        // doesn't go through format_highlighted. Sanitize here before printing.
+        let body = crate::sanitize::sanitize_control_chars(&body);
         for line in body.lines() {
             print_highlighted_colored(line, pattern);
         }
@@ -381,6 +385,7 @@ impl Formatter {
             "dst_port": packet.dst_port,
             "payload_len": packet.payload.len(),
             "payload": packet.payload_str(),
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(&packet.payload),
             "vlan_id": packet.vlan_id,
             "icmp_type": packet.icmp_type,
             "icmp_code": packet.icmp_code,
@@ -394,6 +399,7 @@ impl Formatter {
             "stream": stream.key.to_string(),
             "payload_len": stream.payload.len(),
             "payload": stream.payload_str(),
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(&stream.payload),
         })
     }
 
@@ -488,8 +494,9 @@ pub fn format_highlighted(text: &str, pattern: &Option<Regex>) -> String {
 }
 
 /// Print payload with regex matches highlighted in red (colored output to stdout).
+/// L12: Does NOT re-sanitize — callers must ensure text is already sanitized
+/// (via format_highlighted or sanitize_control_chars) before calling this.
 fn print_highlighted_colored(text: &str, pattern: &Option<Regex>) {
-    let text = &crate::sanitize::sanitize_control_chars(text);
     match pattern {
         Some(re) => {
             let bytes = text.as_bytes();

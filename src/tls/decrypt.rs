@@ -5,6 +5,11 @@ use ring::hmac;
 use zeroize::Zeroize;
 
 /// Derived encryption keys for one direction of a TLS connection.
+///
+/// **Security note:** The IV is zeroized on drop, but `ring::aead::LessSafeKey`
+/// does not expose the underlying key bytes or implement `Zeroize`, so the
+/// actual encryption key material will persist in memory until the page is
+/// reused by the allocator. This is a known limitation of the `ring` crate.
 pub struct DirectionKeys {
     key: LessSafeKey,
     iv: [u8; 12],

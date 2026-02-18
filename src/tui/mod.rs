@@ -222,6 +222,9 @@ fn render(frame: &mut ratatui::Frame, app: &mut AppState) {
     });
     let header = Row::new(header_cells).height(1);
 
+    // L11: Rows Vec is rebuilt each frame. ratatui's Table widget requires the
+    // full row list to calculate scroll position, so caching is not straightforward.
+    // At 100k events (MAX_TUI_EVENTS) this is ~microseconds and not a bottleneck.
     let rows: Vec<Row> = app
         .events
         .iter()

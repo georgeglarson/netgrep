@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::net::IpAddr;
 
 use crate::protocol::{ParsedPacket, StreamKey};
@@ -26,7 +26,9 @@ struct DirectionBuffer {
     /// Next expected sequence number.
     next_seq: Option<u32>,
     /// Out-of-order segments buffered for reordering, keyed by seq number.
-    reorder_buf: BTreeMap<u32, Vec<u8>>,
+    /// Uses HashMap (not BTreeMap) because BTreeMap's natural u32 ordering
+    /// breaks at the TCP sequence number wrap boundary (~4 GB).
+    reorder_buf: HashMap<u32, Vec<u8>>,
     /// Byte offset up to which we've already emitted data.
     emitted_offset: usize,
 }
@@ -36,7 +38,7 @@ impl DirectionBuffer {
         DirectionBuffer {
             payload: Vec::new(),
             next_seq: None,
-            reorder_buf: BTreeMap::new(),
+            reorder_buf: HashMap::new(),
             emitted_offset: 0,
         }
     }
@@ -110,9 +112,8 @@ impl DirectionBuffer {
     /// Drain reorder buffer for segments that are now in order.
     fn flush_reorder_buf(&mut self, max_bytes: usize) {
         while let Some(expected) = self.next_seq {
-            // Try direct lookup first — handles seq wrapping correctly since
-            // BTreeMap ordering can break at the u32 boundary, but exact key
-            // lookup always works.
+            // Try direct lookup first — exact key lookup works correctly
+            // regardless of sequence number wrapping.
             if let Some(seg_data) = self.reorder_buf.remove(&expected) {
                 let to_copy = seg_data
                     .len()
@@ -124,17 +125,18 @@ impl DirectionBuffer {
                 continue;
             }
 
-            // Fallback: check the first entry for overlap with expected
-            let next_entry = self.reorder_buf.iter().next().map(|(k, _)| *k);
-            match next_entry {
+            // Fallback: scan for any entry that overlaps with expected
+            // (i.e., seg_seq is before expected in TCP sequence space).
+            // Linear scan over at most MAX_REORDER_SEGMENTS (32) entries.
+            let overlapping = self
+                .reorder_buf
+                .keys()
+                .find(|&&seg_seq| (seg_seq.wrapping_sub(expected) as i32) < 0)
+                .copied();
+            match overlapping {
                 Some(seg_seq) => {
-                    let diff = seg_seq.wrapping_sub(expected) as i32;
-                    if diff > 0 {
-                        // Still a gap — stop flushing
-                        break;
-                    }
                     let seg_data = self.reorder_buf.remove(&seg_seq).unwrap();
-                    // Overlap
+                    let diff = seg_seq.wrapping_sub(expected) as i32;
                     let overlap = (-diff) as usize;
                     if overlap < seg_data.len() {
                         let new_data = &seg_data[overlap..];
@@ -160,7 +162,10 @@ impl DirectionBuffer {
     fn drain_new(&mut self) -> Option<Vec<u8>> {
         if self.payload.len() > self.emitted_offset {
             let new_data = self.payload[self.emitted_offset..].to_vec();
-            self.emitted_offset = self.payload.len();
+            // M13: Compact — all data has been emitted, clear the buffer to
+            // free memory instead of letting it grow unbounded.
+            self.payload.clear();
+            self.emitted_offset = 0;
             Some(new_data)
         } else {
             None
@@ -251,8 +256,9 @@ pub struct StreamData {
 }
 
 impl StreamData {
-    pub fn payload_str(&self) -> String {
-        String::from_utf8_lossy(&self.payload).into_owned()
+    /// L2: Returns Cow<str> to avoid allocation when payload is valid UTF-8.
+    pub fn payload_str(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.payload)
     }
 }
 
@@ -265,7 +271,9 @@ impl Default for StreamTable {
 impl StreamTable {
     pub fn new() -> Self {
         StreamTable {
-            streams: HashMap::new(),
+            // L6: Pre-allocate capacity for typical workloads to avoid
+            // repeated HashMap resizing during the initial burst.
+            streams: HashMap::with_capacity(1024),
             // 5,000 streams * 256 KB * 2 directions = ~2.5 GB worst case
             max_streams: 5_000,
             max_stream_bytes: 262_144, // 256 KB per stream per direction
@@ -281,7 +289,7 @@ impl StreamTable {
 
         // M17: Periodically sweep stale streams to prevent memory leaks
         // from connections that never close cleanly.
-        if self.tick.is_multiple_of(10_000) {
+        if self.tick.is_multiple_of(1_000) {
             self.sweep_stale();
         }
         let key = match packet.stream_key() {
@@ -424,8 +432,17 @@ impl StreamTable {
         if flags.fin {
             if is_fwd {
                 state.fin_seen[0] = true;
+                // L7: FIN consumes 1 byte in TCP sequence space. Advance
+                // next_seq so that any retransmission of the FIN (or a
+                // segment that overlaps the FIN position) is handled correctly.
+                if let Some(ref mut ns) = state.fwd.next_seq {
+                    *ns = ns.wrapping_add(1);
+                }
             } else {
                 state.fin_seen[1] = true;
+                if let Some(ref mut ns) = state.rev.next_seq {
+                    *ns = ns.wrapping_add(1);
+                }
             }
         }
 

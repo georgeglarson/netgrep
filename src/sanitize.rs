@@ -12,6 +12,9 @@ pub fn sanitize_control_chars(s: &str) -> String {
                 '\t' | '\n' | '\r' => c,
                 // Replace C0 control chars and DEL
                 '\x00'..='\x08' | '\x0B'..='\x0C' | '\x0E'..='\x1F' | '\x7F' => '\u{FFFD}',
+                // M2: Replace C1 control chars (U+0080-U+009F) which some terminals
+                // interpret as ANSI-like escape sequences (e.g. CSI = U+009B).
+                '\u{0080}'..='\u{009F}' => '\u{FFFD}',
                 // All printable ASCII and unicode pass through
                 _ => c,
             }
@@ -76,6 +79,33 @@ mod tests {
     #[test]
     fn empty_string() {
         assert_eq!(sanitize_control_chars(""), "");
+    }
+
+    #[test]
+    fn replaces_c1_control_chars() {
+        // M2: C1 controls (U+0080-U+009F) can be used for terminal injection.
+        // CSI (U+009B) is equivalent to ESC[ on many terminals.
+        let input = "before\u{009B}31mred\u{009B}0mafter";
+        let result = sanitize_control_chars(input);
+        assert!(!result.contains('\u{009B}'));
+        assert!(result.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn all_c1_control_chars_replaced() {
+        for cp in 0x80u32..=0x9F {
+            let c = char::from_u32(cp).unwrap();
+            let input = format!("x{}y", c);
+            let result = sanitize_control_chars(&input);
+            assert_eq!(result, format!("x\u{FFFD}y"), "U+{:04X} not replaced", cp);
+        }
+    }
+
+    #[test]
+    fn preserves_latin1_above_c1() {
+        // U+00A0 (NBSP) and above should pass through
+        let input = "caf\u{00E9} \u{00A0}test";
+        assert_eq!(sanitize_control_chars(input), input);
     }
 
     #[test]

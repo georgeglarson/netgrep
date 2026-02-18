@@ -44,7 +44,9 @@ impl PacketSource {
             .timeout(1000);
 
         if let Some(kb) = buffer_size {
-            builder = builder.buffer_size(kb * 1024);
+            // L1: Use checked_mul to avoid i32 overflow on large values.
+            let bytes = kb.checked_mul(1024).context("buffer_size overflow")?;
+            builder = builder.buffer_size(bytes);
         }
 
         let mut cap = builder.open().context("Failed to open capture device")?;
