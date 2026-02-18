@@ -302,12 +302,12 @@ impl H2Tracker {
                         } else {
                             // Issue #4: Buffer stream-0 HEADERS without END_HEADERS
                             // for HPACK decode when the final CONTINUATION arrives.
-                            if conn.discard_header_bufs.len() >= MAX_DISCARD_HEADER_BUFS {
-                                if let Some(&evict_id) = conn.discard_header_bufs.keys().next() {
-                                    conn.discard_header_bufs.remove(&evict_id);
-                                    conn.corrupted = true;
-                                    continue;
-                                }
+                            if conn.discard_header_bufs.len() >= MAX_DISCARD_HEADER_BUFS
+                                && let Some(&evict_id) = conn.discard_header_bufs.keys().next()
+                            {
+                                conn.discard_header_bufs.remove(&evict_id);
+                                conn.corrupted = true;
+                                continue;
                             }
                             let mut buf = Vec::new();
                             let overflow = header_block.len() > MAX_HEADER_BLOCK;
@@ -339,14 +339,14 @@ impl H2Tracker {
                             // No END_HEADERS — accumulate fragments for HPACK
                             // decode when the final CONTINUATION arrives.
                             // Evict oldest entry if at capacity to prevent memory exhaustion.
-                            if conn.discard_header_bufs.len() >= MAX_DISCARD_HEADER_BUFS {
-                                if let Some(&evict_id) = conn.discard_header_bufs.keys().next() {
-                                    // Evicted entry's HPACK block was never decoded —
-                                    // connection HPACK state is now corrupted.
-                                    conn.discard_header_bufs.remove(&evict_id);
-                                    conn.corrupted = true;
-                                    continue;
-                                }
+                            if conn.discard_header_bufs.len() >= MAX_DISCARD_HEADER_BUFS
+                                && let Some(&evict_id) = conn.discard_header_bufs.keys().next()
+                            {
+                                // Evicted entry's HPACK block was never decoded —
+                                // connection HPACK state is now corrupted.
+                                conn.discard_header_bufs.remove(&evict_id);
+                                conn.corrupted = true;
+                                continue;
                             }
                             let mut buf = Vec::new();
                             let overflow = header_block.len() > MAX_HEADER_BLOCK;
@@ -538,12 +538,12 @@ impl H2Tracker {
                         // No END_HEADERS — accumulate fragments for HPACK
                         // decode when the final CONTINUATION arrives.
                         // Evict oldest entry if at capacity to prevent memory exhaustion.
-                        if conn.discard_header_bufs.len() >= MAX_DISCARD_HEADER_BUFS {
-                            if let Some(&evict_id) = conn.discard_header_bufs.keys().next() {
-                                conn.discard_header_bufs.remove(&evict_id);
-                                conn.corrupted = true;
-                                continue;
-                            }
+                        if conn.discard_header_bufs.len() >= MAX_DISCARD_HEADER_BUFS
+                            && let Some(&evict_id) = conn.discard_header_bufs.keys().next()
+                        {
+                            conn.discard_header_bufs.remove(&evict_id);
+                            conn.corrupted = true;
+                            continue;
                         }
                         let mut buf = Vec::new();
                         let overflow = header_block.len() > MAX_HEADER_BLOCK;

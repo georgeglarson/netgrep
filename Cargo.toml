@@ -2,7 +2,9 @@
 name = "netgrep"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91"
+readme = "README.md"
+authors = ["George Larson"]
 description = "Grep for the network, for a post-TLS world"
 license = "MIT"
 repository = "https://github.com/georgeglarson/netgrep"

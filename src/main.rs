@@ -408,12 +408,11 @@ fn run_cli_mode(
 
             // Clean up TLS state when stream is closed (FIN/RST/eviction)
             // to zeroize key material promptly instead of waiting for LRU eviction.
-            if let Some(key) = parsed.stream_key() {
-                if !stream_table.contains(&key) {
-                    if let Some(d) = tls_decryptor.as_mut() {
-                        d.remove_connection(&key);
-                    }
-                }
+            if let Some(key) = parsed.stream_key()
+                && !stream_table.contains(&key)
+                && let Some(d) = tls_decryptor.as_mut()
+            {
+                d.remove_connection(&key);
             }
         } else {
             // M4: Skip TLS resolution in no-reassemble path — TLS decryption
@@ -571,12 +570,11 @@ fn run_tui_mode(
                 }
 
                 // Clean up TLS state when stream is closed (FIN/RST/eviction)
-                if let Some(key) = parsed.stream_key() {
-                    if !stream_table.contains(&key) {
-                        if let Some(d) = tls_decryptor.as_mut() {
-                            d.remove_connection(&key);
-                        }
-                    }
+                if let Some(key) = parsed.stream_key()
+                    && !stream_table.contains(&key)
+                    && let Some(d) = tls_decryptor.as_mut()
+                {
+                    d.remove_connection(&key);
                 }
             } else {
                 // M1/M2: Skip TLS resolution in no-reassemble path — TLS decryption

@@ -304,7 +304,7 @@ fn render(frame: &mut ratatui::Frame, app: &mut AppState) {
 
     let detail_text = match app.selected_event() {
         Some(ev) => {
-            let sanitized_header = crate::sanitize::sanitize_control_chars(&ev.detail.header());
+            let sanitized_header = crate::sanitize::sanitize_control_chars(ev.detail.header());
             let mut lines = vec![Line::from(Span::styled(
                 sanitized_header,
                 Style::default()

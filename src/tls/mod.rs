@@ -315,14 +315,14 @@ impl TlsDecryptor {
                 TlsRecordType::Handshake | TlsRecordType::ApplicationData => {
                     if let Some(mut plaintext) = self.decrypt_record(key, &record, src_ip, src_port)
                     {
-                        if record.hdr.record_type == TlsRecordType::ApplicationData {
-                            if let Some(conn) = self.connections.get_mut(key) {
-                                let remaining =
-                                    MAX_DECRYPTED_BYTES.saturating_sub(conn.decrypted.len());
-                                let to_copy = plaintext.len().min(remaining);
-                                if to_copy > 0 {
-                                    conn.decrypted.extend_from_slice(&plaintext[..to_copy]);
-                                }
+                        if record.hdr.record_type == TlsRecordType::ApplicationData
+                            && let Some(conn) = self.connections.get_mut(key)
+                        {
+                            let remaining =
+                                MAX_DECRYPTED_BYTES.saturating_sub(conn.decrypted.len());
+                            let to_copy = plaintext.len().min(remaining);
+                            if to_copy > 0 {
+                                conn.decrypted.extend_from_slice(&plaintext[..to_copy]);
                             }
                         }
                         plaintext.zeroize();
