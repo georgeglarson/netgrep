@@ -188,23 +188,25 @@ impl CaptureEvent {
             ("DNS Q".into(), format!("{} {}", qname, qtype))
         };
 
+        // Cap record display at 100 entries per section to bound memory.
+        const MAX_DISPLAY_RECORDS: usize = 100;
         let mut display = String::new();
-        for q in &info.questions {
+        for q in info.questions.iter().take(MAX_DISPLAY_RECORDS) {
             display.push_str(&format!("Q: {} {}\n", q.name, q.qtype));
         }
-        for r in &info.answers {
+        for r in info.answers.iter().take(MAX_DISPLAY_RECORDS) {
             display.push_str(&format!(
                 "A: {} {} {} TTL={}\n",
                 r.name, r.rtype, r.rdata, r.ttl
             ));
         }
-        for r in &info.authorities {
+        for r in info.authorities.iter().take(MAX_DISPLAY_RECORDS) {
             display.push_str(&format!(
                 "AUTH: {} {} {} TTL={}\n",
                 r.name, r.rtype, r.rdata, r.ttl
             ));
         }
-        for r in &info.additionals {
+        for r in info.additionals.iter().take(MAX_DISPLAY_RECORDS) {
             display.push_str(&format!(
                 "ADD: {} {} {} TTL={}\n",
                 r.name, r.rtype, r.rdata, r.ttl
@@ -282,12 +284,26 @@ impl CaptureEvent {
 
         let header = format!("HTTP {} {}{}", stream_id, &info, count_suffix);
 
-        // Combine all messages into the display
-        let display: String = messages
-            .iter()
-            .map(|msg| msg.display_string())
-            .collect::<Vec<_>>()
-            .join("\n---\n");
+        // Combine all messages into the display, capping total size.
+        const MAX_DISPLAY_BYTES: usize = 256 * 1024;
+        let mut display = String::new();
+        for (i, msg) in messages.iter().enumerate() {
+            if i > 0 {
+                display.push_str("\n---\n");
+            }
+            let s = msg.display_string();
+            let remaining = MAX_DISPLAY_BYTES.saturating_sub(display.len());
+            if remaining == 0 {
+                display.push_str("\n[truncated]");
+                break;
+            }
+            if s.len() > remaining {
+                display.push_str(&s[..remaining]);
+                display.push_str("\n[truncated]");
+                break;
+            }
+            display.push_str(&s);
+        }
 
         CaptureEvent {
             id,

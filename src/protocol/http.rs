@@ -248,7 +248,11 @@ pub fn parse_http(data: &[u8]) -> Vec<HttpMessage> {
         for line in lines {
             if (line.starts_with(' ') || line.starts_with('\t')) && !headers.is_empty() {
                 // Continuation line: append to previous header value
+                // Cap individual header value size to prevent abuse via many continuation lines.
                 if let Some(last) = headers.last_mut() {
+                    if last.1.len() + line.len() + 1 > 8192 {
+                        break;
+                    }
                     last.1.push(' ');
                     last.1.push_str(line.trim());
                 }

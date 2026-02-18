@@ -442,8 +442,13 @@ fn format_addr(ip: Option<std::net::IpAddr>, port: Option<u16>) -> String {
 }
 
 /// Build hex + ASCII dump as a String.
+/// Input is capped at 16 KB to prevent unbounded output.
 pub fn format_hex(data: &[u8]) -> String {
     use std::fmt::Write;
+    const MAX_HEX_INPUT: usize = 16 * 1024;
+    let original_len = data.len();
+    let truncated = original_len > MAX_HEX_INPUT;
+    let data = &data[..data.len().min(MAX_HEX_INPUT)];
     let mut out = String::new();
     for (i, chunk) in data.chunks(16).enumerate() {
         write!(out, "{:08x}  ", i * 16).unwrap();
@@ -472,6 +477,9 @@ pub fn format_hex(data: &[u8]) -> String {
             }
         }
         out.push_str("|\n");
+    }
+    if truncated {
+        writeln!(out, "[... truncated, {} bytes total]", original_len).unwrap();
     }
     out
 }

@@ -127,7 +127,8 @@ fn main() -> Result<()> {
             Some(
                 regex::bytes::RegexBuilder::new(&pat)
                     .size_limit(10 * 1024 * 1024)
-                    .build()?,
+                    .build()
+                    .context(format!("Invalid regex pattern: {}", p))?,
             )
         }
         None => None,

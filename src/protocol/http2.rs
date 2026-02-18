@@ -25,6 +25,10 @@ const MAX_FRAME_PAYLOAD: usize = 16_777_215; // 2^24 - 1
 const MAX_STREAMS_PER_CONN: usize = 1_000;
 const MAX_HEADER_BLOCK: usize = 65_536;
 const MAX_DATA_PER_STREAM: usize = 1_048_576; // 1 MB
+/// Cap on discard_header_bufs entries (streams with incomplete CONTINUATION
+/// sequences).  Much smaller than MAX_STREAMS_PER_CONN because each entry
+/// can hold up to MAX_HEADER_BLOCK (64 KB) of buffered header data.
+const MAX_DISCARD_HEADER_BUFS: usize = 64;
 /// M1: Reduced from 10,000 to 2,000 to cap compound memory usage.
 /// 2,000 connections * 2 MB * 2 directions = ~8 GB worst case.
 const MAX_CONNECTIONS: usize = 2_000;
@@ -299,7 +303,7 @@ impl H2Tracker {
                                 H2Direction::ServerToClient => &mut conn.server_decoder,
                             };
                             let _ = decoder.decode(header_block);
-                        } else if conn.discard_header_bufs.len() < MAX_STREAMS_PER_CONN {
+                        } else if conn.discard_header_bufs.len() < MAX_DISCARD_HEADER_BUFS {
                             // No END_HEADERS — accumulate fragments for HPACK
                             // decode when the final CONTINUATION arrives.
                             // Cap discard_header_bufs to prevent memory exhaustion.
@@ -469,7 +473,7 @@ impl H2Tracker {
                             H2Direction::ServerToClient => &mut conn.server_decoder,
                         };
                         let _ = decoder.decode(header_block);
-                    } else if conn.discard_header_bufs.len() < MAX_STREAMS_PER_CONN {
+                    } else if conn.discard_header_bufs.len() < MAX_DISCARD_HEADER_BUFS {
                         // No END_HEADERS — accumulate fragments for HPACK
                         // decode when the final CONTINUATION arrives.
                         // Cap discard_header_bufs to prevent memory exhaustion.

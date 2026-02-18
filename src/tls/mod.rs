@@ -166,9 +166,8 @@ impl TlsDecryptor {
         };
         if overflow {
             eprintln!(
-                "Warning: TLS {} buffer overflow for {:?}, removing connection",
+                "Warning: TLS {} buffer overflow, removing connection",
                 if from_client { "client" } else { "server" },
-                key
             );
             self.connections.remove(key);
             return;
@@ -306,15 +305,19 @@ impl TlsDecryptor {
                 }
                 // After CCS, handshake records (Finished) are encrypted — decrypt to advance seq
                 TlsRecordType::Handshake | TlsRecordType::ApplicationData => {
-                    if let Some(plaintext) = self.decrypt_record(key, &record, src_ip, src_port)
-                        && record.hdr.record_type == TlsRecordType::ApplicationData
-                        && let Some(conn) = self.connections.get_mut(key)
+                    if let Some(mut plaintext) = self.decrypt_record(key, &record, src_ip, src_port)
                     {
-                        let remaining = MAX_DECRYPTED_BYTES.saturating_sub(conn.decrypted.len());
-                        let to_copy = plaintext.len().min(remaining);
-                        if to_copy > 0 {
-                            conn.decrypted.extend_from_slice(&plaintext[..to_copy]);
+                        if record.hdr.record_type == TlsRecordType::ApplicationData {
+                            if let Some(conn) = self.connections.get_mut(key) {
+                                let remaining =
+                                    MAX_DECRYPTED_BYTES.saturating_sub(conn.decrypted.len());
+                                let to_copy = plaintext.len().min(remaining);
+                                if to_copy > 0 {
+                                    conn.decrypted.extend_from_slice(&plaintext[..to_copy]);
+                                }
+                            }
                         }
+                        plaintext.zeroize();
                     }
                 }
                 _ => {}
@@ -349,21 +352,32 @@ impl TlsDecryptor {
         // complete messages (a single TLS record can contain multiple handshake
         // messages). We extract one message per iteration while holding the
         // borrow, release it to call process_handshake, then re-acquire.
+        // Check overflow before taking mutable borrow for extend.
+        let overflow = match self.connections.get(key) {
+            Some(conn) => {
+                let buf_len = if from_client {
+                    conn.handshake_buf_client.len()
+                } else {
+                    conn.handshake_buf_server.len()
+                };
+                buf_len + data.len() > MAX_HANDSHAKE_BUF
+            }
+            None => return,
+        };
+        if overflow {
+            self.connections.remove(key);
+            return;
+        }
         {
             let conn = match self.connections.get_mut(key) {
                 Some(c) => c,
                 None => return,
             };
-            let buf = if from_client {
-                &mut conn.handshake_buf_client
+            if from_client {
+                conn.handshake_buf_client.extend_from_slice(data);
             } else {
-                &mut conn.handshake_buf_server
-            };
-            if buf.len() + data.len() > MAX_HANDSHAKE_BUF {
-                buf.clear();
-                return;
+                conn.handshake_buf_server.extend_from_slice(data);
             }
-            buf.extend_from_slice(data);
         }
 
         loop {
@@ -484,14 +498,17 @@ impl TlsDecryptor {
         hash_algo: hkdf::Algorithm,
         aead_algo: &'static aead::Algorithm,
     ) {
-        let secrets = match self.keylog.tls13_secrets.get(client_random) {
+        let mut secrets = match self.keylog.tls13_secrets.get(client_random) {
             Some(s) => s.clone(),
             None => return,
         };
 
         let conn = match self.connections.get_mut(key) {
             Some(c) => c,
-            None => return,
+            None => {
+                secrets.zeroize();
+                return;
+            }
         };
 
         // Derive application traffic keys
@@ -517,6 +534,7 @@ impl TlsDecryptor {
         {
             conn.server_hs_keys = Some(keys);
         }
+        secrets.zeroize();
     }
 
     fn derive_tls12_keys(
