@@ -1,5 +1,7 @@
 # netgrep
 
+> Also on [Codeberg](https://codeberg.org/georgelarson/netgrep)
+
 [![CI](https://github.com/georgeglarson/netgrep/actions/workflows/ci.yml/badge.svg)](https://github.com/georgeglarson/netgrep/actions/workflows/ci.yml)
 
 **Grep for the network, for a post-TLS world.**
