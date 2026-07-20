@@ -53,6 +53,16 @@ struct TlsConnection {
     /// Once true, only application keys are tried (no dual-try fallback).
     client_hs_complete: bool,
     server_hs_complete: bool,
+    /// Set once any application-data record has been processed for this
+    /// connection. Mid-stream key derivation (live keylog) is only safe before
+    /// this: a freshly-derived DirectionKeys starts its AEAD sequence counter
+    /// at 0, which is only correct if no earlier ciphertext record was skipped.
+    /// Deriving after app data has flowed would desync the counter and make
+    /// every subsequent record fail to decrypt — silently and permanently.
+    app_data_started: bool,
+    /// One-shot guard so the "secret arrived too late to decrypt" warning is
+    /// emitted at most once per connection.
+    warned_missed_key_window: bool,
 }
 
 impl TlsConnection {
@@ -78,6 +88,8 @@ impl TlsConnection {
             handshake_buf_server: Vec::new(),
             client_hs_complete: false,
             server_hs_complete: false,
+            app_data_started: false,
+            warned_missed_key_window: false,
         }
     }
 
@@ -313,11 +325,10 @@ impl TlsDecryptor {
                 }
                 // After CCS, handshake records (Finished) are encrypted — decrypt to advance seq
                 TlsRecordType::Handshake | TlsRecordType::ApplicationData => {
+                    let is_app_data = record.hdr.record_type == TlsRecordType::ApplicationData;
                     if let Some(mut plaintext) = self.decrypt_record(key, &record, src_ip, src_port)
                     {
-                        if record.hdr.record_type == TlsRecordType::ApplicationData
-                            && let Some(conn) = self.connections.get_mut(key)
-                        {
+                        if is_app_data && let Some(conn) = self.connections.get_mut(key) {
                             let remaining =
                                 MAX_DECRYPTED_BYTES.saturating_sub(conn.decrypted.len());
                             let to_copy = plaintext.len().min(remaining);
@@ -326,6 +337,13 @@ impl TlsDecryptor {
                             }
                         }
                         plaintext.zeroize();
+                    }
+                    // Record that application data has now flowed (decrypted or
+                    // not): past this point a late keylog secret can no longer
+                    // be used without desyncing the AEAD sequence counter, so
+                    // decrypt_record stops re-deriving for this connection.
+                    if is_app_data && let Some(conn) = self.connections.get_mut(key) {
+                        conn.app_data_started = true;
                     }
                 }
                 _ => {}
@@ -628,13 +646,35 @@ impl TlsDecryptor {
         // ServerHello may have been processed before the client wrote this
         // session's secret to the keylog; try_derive_keys refreshes the keylog
         // on a miss, so a secret that landed since is picked up here.
-        let no_keys = self
+        //
+        // But only while no application-data record has flowed yet. A freshly
+        // derived DirectionKeys starts its AEAD sequence counter at 0, which is
+        // correct only if we haven't already skipped an earlier ciphertext
+        // record for this connection. Deriving after app data has passed would
+        // leave the counter behind the peer's, so every record would fail to
+        // decrypt — silently and permanently. In that case decline (warn once).
+        let (no_keys, app_started) = self
             .connections
             .get(key)
-            .map(|c| c.client_keys.is_none() && c.server_keys.is_none())
-            .unwrap_or(false);
-        if no_keys {
+            .map(|c| {
+                (
+                    c.client_keys.is_none() && c.server_keys.is_none(),
+                    c.app_data_started,
+                )
+            })
+            .unwrap_or((false, false));
+        if no_keys && !app_started {
             self.try_derive_keys(key);
+        } else if no_keys
+            && app_started
+            && let Some(c) = self.connections.get_mut(key)
+            && !c.warned_missed_key_window
+        {
+            c.warned_missed_key_window = true;
+            eprintln!(
+                "Warning: a TLS session's keylog secret arrived after its application \
+                 data; that session cannot be decrypted (secret not captured in time)."
+            );
         }
 
         let conn = self.connections.get_mut(key)?;

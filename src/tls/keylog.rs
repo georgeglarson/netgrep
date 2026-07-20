@@ -119,11 +119,15 @@ impl KeyLog {
             // Not there (yet) or unreadable — keep what we have.
             Err(_) => return false,
         };
-        if size == self.last_size {
+        // Only act on growth. SSLKEYLOGFILE is append-only, so a larger file is
+        // a superset of what we hold and re-parsing is safe. A same-or-smaller
+        // size means either nothing new or a rotation/truncation; in the latter
+        // case the re-read would be a strict subset, and swapping it in would
+        // drop secrets we still hold, so we keep what we have instead.
+        if size <= self.last_size {
             return false;
         }
-        // The file grew (append) or shrank (rotation): re-parse the whole
-        // thing. It's a superset of what we hold, bounded by MAX_KEYLOG_SIZE.
+        // The file grew: re-parse the whole thing (bounded by MAX_KEYLOG_SIZE).
         match Self::from_file(&path) {
             Ok(mut fresh) => {
                 // Swap the fresh maps in; `fresh` then owns the old maps and
