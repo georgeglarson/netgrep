@@ -692,8 +692,20 @@ impl TlsDecryptor {
             aead_algo,
             hmac_algo,
         ) {
-            conn.client_keys = Some(client_keys);
-            conn.server_keys = Some(server_keys);
+            // TLS 1.2 derives both directions from one master secret, but only
+            // install each into a direction that has no keys yet AND whose
+            // application epoch hasn't started — same guard as the 1.3 path.
+            // decrypt_record's re-derive gate is now per-direction, so this can
+            // be reached to fill one direction while the other has already had
+            // app data skip past with no key; installing a fresh key at
+            // sequence 0 there would desync it. The unused DirectionKeys is
+            // dropped (zeroizing its IV).
+            if conn.client_keys.is_none() && !conn.client_app_data_started {
+                conn.client_keys = Some(client_keys);
+            }
+            if conn.server_keys.is_none() && !conn.server_app_data_started {
+                conn.server_keys = Some(server_keys);
+            }
         }
         master_secret.zeroize();
     }
