@@ -47,23 +47,37 @@ capture() {
   local _
   for _ in $(seq 1 25); do grep -q listening "$err" 2>/dev/null && break; sleep 0.2; done
 
+  # curl opens SSLKEYLOGFILE in append mode, so truncate first — otherwise a
+  # re-run leaves the keylog holding every prior run's secrets and it stops
+  # being a faithful pairing with the freshly-captured pcap.
+  : > "$base.keys"
+
   # --retry-connrefused rides out the server not being bound yet without a
   # separate readiness poll; a refused connection produces no TLS records, so
-  # the capture and keylog stay clean.
+  # the capture and keylog stay clean. Capture curl's exit rather than let it
+  # abort mid-function (set -e) — a nonzero rc means the port was held by a
+  # foreign service or the handshake failed, i.e. a bad fixture.
   # $curlflags is intentionally unquoted: it must word-split ("--tlsv1.2" ->
   # one flag) or vanish entirely when empty, which "$curlflags" would not do.
+  local curl_rc=0
   # shellcheck disable=SC2086
   SSLKEYLOGFILE="$base.keys" curl -sk --retry 5 --retry-connrefused --retry-delay 1 \
-    $curlflags "https://localhost:$port/$marker" >/dev/null 2>&1
+    $curlflags "https://localhost:$port/$marker" >/dev/null 2>&1 || curl_rc=$?
 
   sleep 1
   sudo kill -INT "$td" 2>/dev/null || true; sleep 0.3
   kill "$srv" 2>/dev/null || true
   wait 2>/dev/null || true
-  sudo chown "$(id -u):$(id -g)" "$base.pcap"
+  # Always chown, even on a failed run, so tcpdump never leaves a root-owned
+  # pcap in the tree for the next non-sudo invocation to trip over.
+  sudo chown "$(id -u):$(id -g)" "$base.pcap" 2>/dev/null || true
 
-  # Fail loud rather than commit a silently-empty/garbage capture (e.g. the
-  # chosen port was already in use, so nothing relevant was captured).
+  # Fail loud rather than commit a silently-bad capture: curl error (port held
+  # by something else), or an empty/garbage pcap (port busy, nothing relevant).
+  if [ "$curl_rc" -ne 0 ]; then
+    echo "ERROR: curl failed (rc=$curl_rc) for $base — port $port held by another service?" >&2
+    return 1
+  fi
   if [ ! -s "$base.pcap" ] || [ "$(wc -c <"$base.pcap")" -lt 500 ]; then
     echo "ERROR: $base.pcap is empty or too small — capture failed (port $port busy?)." >&2
     return 1
