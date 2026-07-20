@@ -129,7 +129,13 @@ impl KeyLog {
         }
         // The file grew: re-parse the whole thing (bounded by MAX_KEYLOG_SIZE).
         match Self::from_file(&path) {
-            Ok(mut fresh) => {
+            // Only accept a re-read at least as large as what we already hold.
+            // The file could be unlinked or truncated between the metadata()
+            // above and from_file's read (e.g. a log rotator that unlinks-then-
+            // recreates rather than atomically renaming); from_file tolerates a
+            // vanished file by returning an empty log (last_size 0), and
+            // swapping that in would wipe every secret we have. Guard against it.
+            Ok(mut fresh) if fresh.last_size >= self.last_size => {
                 // Swap the fresh maps in; `fresh` then owns the old maps and
                 // its Drop zeroizes them. Keep our own source unchanged.
                 std::mem::swap(&mut self.master_secrets, &mut fresh.master_secrets);
@@ -137,7 +143,17 @@ impl KeyLog {
                 self.last_size = fresh.last_size;
                 true
             }
-            Err(_) => false,
+            // Re-read came back smaller than we hold (a truncation/unlink race):
+            // keep our secrets, and don't advance last_size, so a genuine later
+            // growth is still picked up.
+            Ok(_) => false,
+            // Oversized or invalid keylog: cache this size so a persistently bad
+            // file isn't re-read in full on every subsequent decrypt miss (it
+            // will only be retried once the file grows past this size).
+            Err(_) => {
+                self.last_size = size;
+                false
+            }
         }
     }
 

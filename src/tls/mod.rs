@@ -332,17 +332,19 @@ impl TlsDecryptor {
                 // After CCS, handshake records (Finished) are encrypted — decrypt to advance seq
                 TlsRecordType::Handshake | TlsRecordType::ApplicationData => {
                     let is_app_data = record.hdr.record_type == TlsRecordType::ApplicationData;
-                    // Whether this record belongs to the application-data epoch,
-                    // which is what consumes the *application* keys' AEAD
-                    // sequence. TLS 1.2 exposes the type on the wire, so the
-                    // ApplicationData record type is authoritative. TLS 1.3
+                    // Whether this record consumes the AEAD sequence counter that
+                    // a late-derived key (starting at sequence 0) must stay
+                    // aligned with. TLS 1.2: every post-ChangeCipherSpec record
+                    // is encrypted under the one cipher — the Finished (a
+                    // Handshake record) is sequence 0, app data follows — so any
+                    // cipher-active record counts, not just ApplicationData;
+                    // keying on the wire type alone would miss the Finished and
+                    // let a late key install at sequence 0 after it. TLS 1.3
                     // disguises every post-ServerHello record as ApplicationData
-                    // on the wire (EncryptedExtensions, Certificate, Finished,
-                    // real app data all share type 23), so the wire type would
-                    // wrongly flag the handshake records. Use the handshake-phase
-                    // flag as it stood *before* this record: only records after
-                    // the Finished are app-epoch (the Finished itself flips
-                    // hs_complete but is still handshake-epoch).
+                    // on the wire, but its handshake and application epochs have
+                    // *separate* sequences, so use the handshake-phase flag as it
+                    // stood *before* this record: only records after the Finished
+                    // consume the application sequence.
                     let app_epoch = match self.connections.get(key).and_then(|c| c.version) {
                         Some(TlsVersion::Tls13) => self
                             .connections
@@ -355,7 +357,7 @@ impl TlsDecryptor {
                                 }
                             })
                             .unwrap_or(false),
-                        _ => is_app_data,
+                        _ => cipher_active,
                     };
                     if let Some(mut plaintext) = self.decrypt_record(key, &record, src_ip, src_port)
                     {
@@ -761,8 +763,10 @@ impl TlsDecryptor {
         {
             c.warned_missed_key_window = true;
             eprintln!(
-                "Warning: some traffic in a TLS session could not be decrypted — a \
-                 keylog secret arrived after that direction's application data."
+                "Warning: some traffic in a TLS session could not be decrypted — no \
+                 usable key was available for a direction by the time its application \
+                 data arrived (its secret is missing from the keylog, or was written \
+                 too late to capture)."
             );
         }
 
