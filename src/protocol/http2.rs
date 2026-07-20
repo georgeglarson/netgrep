@@ -727,7 +727,7 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.as_slice(), v.as_slice()))
             .collect();
-        encoder.encode(refs.into_iter())
+        encoder.encode(refs)
     }
 
     #[test]
