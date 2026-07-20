@@ -514,7 +514,13 @@ impl TlsDecryptor {
                 Some(c) => c,
                 None => return,
             };
-            if conn.client_keys.is_some() {
+            // Nothing left to do only once BOTH directions' application keys are
+            // set. For TLS 1.3 the client/server traffic secrets can land in the
+            // keylog at different times, so bailing on client_keys alone would
+            // strand the server direction (and vice versa). TLS 1.2 derives both
+            // from one master secret, so both flip together — this is equivalent
+            // there.
+            if conn.client_keys.is_some() && conn.server_keys.is_some() {
                 return;
             }
             let cr = match conn.client_random {
@@ -558,9 +564,20 @@ impl TlsDecryptor {
         hash_algo: hkdf::Algorithm,
         aead_algo: &'static aead::Algorithm,
     ) {
-        // Live capture: the client may write this session's secret to the
-        // keylog after we first read it. On a miss, re-read before giving up.
-        if !self.keylog.tls13_secrets.contains_key(client_random) {
+        // Live capture: the client writes a session's secrets to the keylog
+        // over time — handshake-traffic secrets first, then the application-
+        // traffic secrets once the handshake completes. Re-read the keylog
+        // until we have BOTH application-traffic secrets, not merely until an
+        // entry exists: the handshake secrets create a partial entry, so a
+        // presence-only check would latch and never pick up the later app
+        // secrets (leaving the connection undecryptable).
+        let have_app_secrets = self
+            .keylog
+            .tls13_secrets
+            .get(client_random)
+            .map(|s| s.client_traffic_secret_0.is_some() && s.server_traffic_secret_0.is_some())
+            .unwrap_or(false);
+        if !have_app_secrets {
             self.keylog.refresh();
         }
         let mut secrets = match self.keylog.tls13_secrets.get(client_random) {
@@ -576,25 +593,37 @@ impl TlsDecryptor {
             }
         };
 
-        // Derive application traffic keys
-        if let Some(ref client_secret) = secrets.client_traffic_secret_0
+        // Derive application traffic keys. Only fill a direction that has none
+        // yet: re-deriving would install a fresh DirectionKeys with its AEAD
+        // sequence reset to 0, desyncing an already-decrypting direction. This
+        // makes the function safe to re-enter as late secrets arrive.
+        if conn.client_keys.is_none()
+            && let Some(ref client_secret) = secrets.client_traffic_secret_0
             && let Ok(keys) = decrypt::derive_tls13_keys(client_secret, hash_algo, aead_algo)
         {
             conn.client_keys = Some(keys);
         }
-        if let Some(ref server_secret) = secrets.server_traffic_secret_0
+        if conn.server_keys.is_none()
+            && let Some(ref server_secret) = secrets.server_traffic_secret_0
             && let Ok(keys) = decrypt::derive_tls13_keys(server_secret, hash_algo, aead_algo)
         {
             conn.server_keys = Some(keys);
         }
 
-        // Derive handshake traffic keys (for encrypted handshake messages)
-        if let Some(ref client_hs_secret) = secrets.client_handshake_traffic_secret
+        // Derive handshake traffic keys (for encrypted handshake messages).
+        // Skip once the handshake is complete for a direction: the keys are
+        // deliberately dropped then (see decrypt_tls13_record), and re-deriving
+        // would resurrect stale, now-unused keys.
+        if conn.client_hs_keys.is_none()
+            && !conn.client_hs_complete
+            && let Some(ref client_hs_secret) = secrets.client_handshake_traffic_secret
             && let Ok(keys) = decrypt::derive_tls13_keys(client_hs_secret, hash_algo, aead_algo)
         {
             conn.client_hs_keys = Some(keys);
         }
-        if let Some(ref server_hs_secret) = secrets.server_handshake_traffic_secret
+        if conn.server_hs_keys.is_none()
+            && !conn.server_hs_complete
+            && let Some(ref server_hs_secret) = secrets.server_handshake_traffic_secret
             && let Ok(keys) = decrypt::derive_tls13_keys(server_hs_secret, hash_algo, aead_algo)
         {
             conn.server_hs_keys = Some(keys);
@@ -679,27 +708,30 @@ impl TlsDecryptor {
         // record for this connection. Deriving after app data has passed would
         // leave the counter behind the peer's, so every record would fail to
         // decrypt — silently and permanently. In that case decline (warn once).
-        let (no_keys, app_started) = self
+        // "Missing" means either direction still lacks application keys — TLS
+        // 1.3 client/server traffic secrets can land in the keylog separately,
+        // so we keep trying until both are in hand, not just until one is.
+        let (missing_keys, app_started) = self
             .connections
             .get(key)
             .map(|c| {
                 (
-                    c.client_keys.is_none() && c.server_keys.is_none(),
+                    c.client_keys.is_none() || c.server_keys.is_none(),
                     c.app_data_started,
                 )
             })
             .unwrap_or((false, false));
-        if no_keys && !app_started {
+        if missing_keys && !app_started {
             self.try_derive_keys(key);
-        } else if no_keys
+        } else if missing_keys
             && app_started
             && let Some(c) = self.connections.get_mut(key)
             && !c.warned_missed_key_window
         {
             c.warned_missed_key_window = true;
             eprintln!(
-                "Warning: a TLS session's keylog secret arrived after its application \
-                 data; that session cannot be decrypted (secret not captured in time)."
+                "Warning: some traffic in a TLS session could not be decrypted — a \
+                 keylog secret arrived after that direction's application data."
             );
         }
 
