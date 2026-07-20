@@ -9,3 +9,5 @@
 .idea/
 .vscode/
 *.pcap
+# ...but keep the committed TLS end-to-end decryption fixtures.
+!tests/fixtures/*.pcap
