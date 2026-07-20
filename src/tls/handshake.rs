@@ -17,9 +17,10 @@ pub(crate) struct HandshakeResult {
 
 /// Parse a TLS handshake record and extract cryptographic parameters.
 ///
-/// `current_version` is the version already set on the connection (if any),
-/// used to preserve ClientHello's supported_versions detection over ServerHello's
-/// legacy version field.
+/// `current_version` is the negotiated version already fixed on the connection
+/// by an earlier ServerHello (if any). It exists only so a retransmitted
+/// ServerHello can't clobber that decision; the ClientHello's offered versions
+/// deliberately do not set the negotiated version (only the ServerHello does).
 ///
 /// M8: Callers should use `TlsDecryptor::accumulate_handshake` to reassemble
 /// handshake messages spanning multiple TLS records before calling this function.

@@ -27,7 +27,7 @@ Built early 2026 as an AI-assisted portfolio project: a working demo of what a m
 Where it stands after a July 2026 cleanup pass:
 
 - Builds clean and passes its full test suite (~380 tests) on current stable Rust, with a clean `clippy -D warnings`.
-- Verified against live traffic, not only unit vectors: live packet capture off an interface, DNS parsing, TCP stream reassembly, and TLS 1.2 + 1.3 (AES-GCM) decryption of real sessions captured off the wire, with `SSLKEYLOGFILE` read live as the client writes it mid-session. The same decryption is reproducible offline from checked-in captures (`tests/tls_e2e.rs`, regenerate with `tests/fixtures/generate.sh`).
+- Verified against live traffic, not only test vectors: live packet capture off an interface, DNS parsing, TCP stream reassembly, and TLS 1.2 + 1.3 (AES-GCM) decryption of real sessions captured off the wire, with `SSLKEYLOGFILE` read live as the client writes it mid-session. The same decryption is reproducible offline from checked-in captures (`tests/tls_e2e.rs`, regenerate with `tests/fixtures/generate.sh`).
 - Other cipher suites (ChaCha20-Poly1305, AES-256, RSA key exchange) pass known-answer vectors but haven't been run against captured sessions yet.
 - Not actively maintained. Issues and PRs are welcome, no support promised.
 
