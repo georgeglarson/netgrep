@@ -322,6 +322,55 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn refresh_completes_a_partial_tls13_entry() {
+        // The live-1.3 case that a presence-only refresh gate missed: a client
+        // writes its handshake-traffic secrets first (creating a partial entry
+        // for the client_random), then its application-traffic secrets once the
+        // handshake completes. refresh() must merge the later app secrets into
+        // the existing entry, not treat the entry as already complete.
+        use std::io::Write;
+        let path =
+            std::env::temp_dir().join(format!("netgrep_partial13_{}.keys", std::process::id()));
+        let cr = "aa".repeat(32);
+        let secret = "bb".repeat(32);
+        std::fs::write(
+            &path,
+            format!(
+                "CLIENT_HANDSHAKE_TRAFFIC_SECRET {cr} {secret}\n\
+                 SERVER_HANDSHAKE_TRAFFIC_SECRET {cr} {secret}\n"
+            ),
+        )
+        .unwrap();
+
+        let mut kl = KeyLog::from_file(&path).unwrap();
+        let entry = kl.tls13_secrets.values().next().unwrap();
+        assert!(entry.client_handshake_traffic_secret.is_some());
+        assert!(
+            entry.client_traffic_secret_0.is_none(),
+            "app-traffic secret should not be present yet"
+        );
+
+        // App-traffic secrets land later, appended for the SAME client_random.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "CLIENT_TRAFFIC_SECRET_0 {cr} {secret}").unwrap();
+        writeln!(f, "SERVER_TRAFFIC_SECRET_0 {cr} {secret}").unwrap();
+        drop(f);
+
+        assert!(kl.refresh());
+        assert_eq!(kl.tls13_secrets.len(), 1, "still one connection");
+        let entry = kl.tls13_secrets.values().next().unwrap();
+        assert!(
+            entry.client_traffic_secret_0.is_some() && entry.server_traffic_secret_0.is_some(),
+            "app-traffic secrets appended for the same random must be picked up"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // T13: KeyLog edge case tests
 
     #[test]
