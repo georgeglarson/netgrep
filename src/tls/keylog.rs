@@ -147,11 +147,15 @@ impl KeyLog {
             // keep our secrets, and don't advance last_size, so a genuine later
             // growth is still picked up.
             Ok(_) => false,
-            // Oversized or invalid keylog: cache this size so a persistently bad
-            // file isn't re-read in full on every subsequent decrypt miss (it
-            // will only be retried once the file grows past this size).
+            // Suppress future full re-reads only for a persistently oversized
+            // file — the real per-record I/O risk, and a condition that won't
+            // fix itself below this size. A transient read error or a malformed
+            // (non-UTF-8) file is left un-cached, so a later good read can still
+            // recover rather than being locked out until the file grows.
             Err(_) => {
-                self.last_size = size;
+                if size > Self::MAX_KEYLOG_SIZE {
+                    self.last_size = size;
+                }
                 false
             }
         }
