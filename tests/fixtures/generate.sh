@@ -47,6 +47,16 @@ capture() {
   local _
   for _ in $(seq 1 25); do grep -q listening "$err" 2>/dev/null && break; sleep 0.2; done
 
+  # Confirm OUR s_server actually bound the port before generating traffic. Two
+  # services can't hold the same port, so if the random port was already taken,
+  # s_server failed to bind and exited — catch that here rather than let curl
+  # (-k) talk to the foreign squatter and capture someone else's session.
+  sleep 0.3
+  if ! kill -0 "$srv" 2>/dev/null; then
+    echo "ERROR: openssl s_server for $base is not running — port $port already in use?" >&2
+    return 1
+  fi
+
   # curl opens SSLKEYLOGFILE in append mode, so truncate first — otherwise a
   # re-run leaves the keylog holding every prior run's secrets and it stops
   # being a faithful pairing with the freshly-captured pcap.
@@ -68,18 +78,28 @@ capture() {
   sudo kill -INT "$td" 2>/dev/null || true; sleep 0.3
   kill "$srv" 2>/dev/null || true
   wait 2>/dev/null || true
+  # These PIDs are now reaped; drop them so the EXIT trap can't signal a reused
+  # PID on a later capture. cert/key temps stay tracked for the final cleanup.
+  BG_PIDS=(); SUDO_PIDS=()
   # Always chown, even on a failed run, so tcpdump never leaves a root-owned
   # pcap in the tree for the next non-sudo invocation to trip over.
   sudo chown "$(id -u):$(id -g)" "$base.pcap" 2>/dev/null || true
 
   # Fail loud rather than commit a silently-bad capture: curl error (port held
-  # by something else), or an empty/garbage pcap (port busy, nothing relevant).
+  # by something else), an empty/garbage pcap, or an empty keylog.
   if [ "$curl_rc" -ne 0 ]; then
     echo "ERROR: curl failed (rc=$curl_rc) for $base — port $port held by another service?" >&2
     return 1
   fi
   if [ ! -s "$base.pcap" ] || [ "$(wc -c <"$base.pcap")" -lt 500 ]; then
     echo "ERROR: $base.pcap is empty or too small — capture failed (port $port busy?)." >&2
+    return 1
+  fi
+  # A curl built against a TLS backend that ignores SSLKEYLOGFILE exits 0 with a
+  # perfectly good pcap and an empty keylog — a silently-useless fixture that
+  # would only surface later as a mystifying tls_e2e failure. Catch it now.
+  if [ ! -s "$base.keys" ]; then
+    echo "ERROR: $base.keys is empty — curl's TLS backend ignored SSLKEYLOGFILE." >&2
     return 1
   fi
   echo "wrote $base.pcap ($(wc -c <"$base.pcap") bytes) + $base.keys"
