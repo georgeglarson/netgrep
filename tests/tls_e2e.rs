@@ -71,30 +71,38 @@ fn decrypts_real_tls12_session() {
     );
 }
 
-#[test]
-fn marker_is_genuinely_encrypted() {
-    // Negative control: without the keylog the marker must NOT appear, proving
-    // the positive tests above decrypt rather than match cleartext.
-    //
-    // We assert netgrep actually *processed* the capture (its per-run summary
-    // line) instead of trusting an exit code. netgrep does not adopt grep's
-    // nonzero-on-no-match convention, and coupling to that would make this the
-    // one test that silently breaks if it ever did — worse, an empty stdout
-    // from a crash would masquerade as "marker absent" and pass.
+/// Negative control: without the keylog, `marker` must NOT appear in netgrep's
+/// output, and netgrep must have actually *processed* the capture (its summary
+/// line) — proving the positive tests decrypt rather than match cleartext.
+///
+/// We assert on the summary line instead of an exit code: netgrep does not
+/// adopt grep's nonzero-on-no-match convention, and coupling to that would
+/// make this silently break if it ever did — worse, an empty stdout from a
+/// crash would masquerade as "marker absent" and pass.
+fn assert_marker_encrypted(pcap: &str, marker: &str) {
     let out = netgrep()
         .arg("-I")
-        .arg(fixture("tls12_ecdhe_rsa_aesgcm.pcap"))
-        .arg("netgrep-tls12-marker-4Rk")
+        .arg(fixture(pcap))
+        .arg(marker)
         .output()
         .expect("failed to run netgrep");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("packets seen"),
-        "netgrep should have processed the capture; summary line missing.\nstderr: {stderr}"
+        "netgrep should have processed {pcap}; summary line missing.\nstderr: {stderr}"
     );
     assert!(
-        !stdout.contains("netgrep-tls12-marker-4Rk"),
-        "marker must be encrypted; it should not be visible without the keylog"
+        !stdout.contains(marker),
+        "marker must be encrypted in {pcap}; it should not be visible without the keylog"
     );
+}
+
+#[test]
+fn markers_are_genuinely_encrypted() {
+    // Run the control against BOTH fixtures. Without a 1.3 control, a
+    // regenerated 1.3 capture that leaked its marker into an unencrypted
+    // record would let decrypts_real_tls13_session pass for the wrong reason.
+    assert_marker_encrypted("tls12_ecdhe_rsa_aesgcm.pcap", "netgrep-tls12-marker-4Rk");
+    assert_marker_encrypted("tls13_aesgcm.pcap", "netgrep-tls13-marker-7Qx");
 }

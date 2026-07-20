@@ -22,10 +22,17 @@ CERT=$(mktemp); KEY=$(mktemp)
 # The privileged tcpdump is the one that matters: left running it keeps
 # capturing indefinitely.
 declare -a BG_PIDS=() SUDO_PIDS=() TMPS=("$CERT" "$KEY")
+# CUR_PCAP/CUR_KEYS name the in-progress capture's artifacts. They're set at the
+# start of each capture and cleared on success; if the script aborts mid-capture
+# the trap removes them, so a failed run never leaves a partial (root-owned)
+# .pcap or stale .keys in the now-tracked tests/fixtures/ dir.
+CUR_PCAP=""; CUR_KEYS=""
 cleanup() {
   local pid
   for pid in ${SUDO_PIDS[@]+"${SUDO_PIDS[@]}"}; do sudo kill "$pid" 2>/dev/null || true; done
   for pid in ${BG_PIDS[@]+"${BG_PIDS[@]}"};   do kill "$pid" 2>/dev/null || true; done
+  [ -n "$CUR_PCAP" ] && sudo rm -f "$CUR_PCAP" 2>/dev/null || true  # may be root-owned
+  [ -n "$CUR_KEYS" ] && rm -f "$CUR_KEYS" 2>/dev/null || true
   rm -f ${TMPS[@]+"${TMPS[@]}"}
 }
 trap cleanup EXIT
@@ -37,6 +44,8 @@ openssl req -x509 -newkey rsa:2048 -keyout "$KEY" -out "$CERT" -days 3650 \
 capture() {
   local tlsflag="$1" curlflags="$2" marker="$3" base="$4" port=$((8600 + RANDOM % 400))
   local err; err=$(mktemp); TMPS+=("$err")
+  # Register this capture's artifacts for removal-on-abort (cleared on success).
+  CUR_PCAP="$base.pcap"; CUR_KEYS="$base.keys"
 
   openssl s_server -accept "$port" -cert "$CERT" -key "$KEY" -www "$tlsflag" -quiet >/dev/null 2>&1 &
   local srv=$!; BG_PIDS+=("$srv")
@@ -46,6 +55,8 @@ capture() {
   # Wait for tcpdump to actually be listening before generating traffic.
   local _
   for _ in $(seq 1 25); do grep -q listening "$err" 2>/dev/null && break; sleep 0.2; done
+  grep -q listening "$err" 2>/dev/null || \
+    echo "WARN: tcpdump never reported listening for $base (see its stderr)." >&2
 
   # Confirm OUR s_server actually bound the port before generating traffic. Two
   # services can't hold the same port, so if the random port was already taken,
@@ -81,8 +92,8 @@ capture() {
   # These PIDs are now reaped; drop them so the EXIT trap can't signal a reused
   # PID on a later capture. cert/key temps stay tracked for the final cleanup.
   BG_PIDS=(); SUDO_PIDS=()
-  # Always chown, even on a failed run, so tcpdump never leaves a root-owned
-  # pcap in the tree for the next non-sudo invocation to trip over.
+  # Hand the (root-owned) capture back to the invoking user. On a failure path
+  # the trap removes it instead; here we only reach the success checks below.
   sudo chown "$(id -u):$(id -g)" "$base.pcap" 2>/dev/null || true
 
   # Fail loud rather than commit a silently-bad capture: curl error (port held
@@ -102,6 +113,8 @@ capture() {
     echo "ERROR: $base.keys is empty — curl's TLS backend ignored SSLKEYLOGFILE." >&2
     return 1
   fi
+  # Success: keep these artifacts (don't let the trap remove them).
+  CUR_PCAP=""; CUR_KEYS=""
   echo "wrote $base.pcap ($(wc -c <"$base.pcap") bytes) + $base.keys"
 }
 
