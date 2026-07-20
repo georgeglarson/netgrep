@@ -20,6 +20,19 @@ A modern replacement for [ngrep](https://github.com/jpr5/ngrep) with TCP stream 
 - **Pcap output** — write matched packets to pcap file (`-O`)
 - **ngrep-compatible flags** — `-i`, `-v`, `-x`, `-q`, `-n`, `-d`, `-I`, `-F`
 
+## Status & provenance
+
+Built early 2026 as an AI-assisted portfolio project: a working demo of what a modern ngrep could be, not a supported product. It was headed for real use at a job before that role was eliminated, so it never got its intended production shakedown.
+
+Where it stands after a July 2026 cleanup pass:
+
+- Builds clean and passes its full test suite (~380 tests) on current stable Rust, with a clean `clippy -D warnings`.
+- Verified against live traffic, not only test vectors: live packet capture off an interface, DNS parsing, TCP stream reassembly, and TLS 1.2 + 1.3 (AES-GCM) decryption of real sessions captured off the wire, with `SSLKEYLOGFILE` read live as the client writes it mid-session. The same decryption is reproducible offline from checked-in captures (`tests/tls_e2e.rs`, regenerate with `tests/fixtures/generate.sh`).
+- Other cipher suites (ChaCha20-Poly1305, AES-256, RSA key exchange) pass known-answer vectors but haven't been run against captured sessions yet.
+- Not actively maintained. Issues and PRs are welcome, no support promised.
+
+Read it as a reference implementation and a code sample, not something to drop straight into production.
+
 ## Installation
 
 ### Prerequisites

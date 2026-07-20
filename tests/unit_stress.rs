@@ -456,7 +456,7 @@ fn reassembly_many_out_of_order_segments() {
         80,
         101,
         psh_ack(),
-        &vec![b'A'; 100],
+        &[b'A'; 100],
     );
     let results = table.process(&pkt);
     // Should have data — at least the in-order part

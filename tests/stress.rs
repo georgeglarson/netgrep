@@ -253,8 +253,15 @@ fn cli_nonexistent_keylog_file() {
         ])
         .output()
         .unwrap();
-    // Should fail gracefully, not panic
-    assert!(!output.status.success());
+    // A missing keylog is now tolerated (start empty, warn, pick it up if it
+    // appears — the live-capture case), rather than aborting the capture. So
+    // netgrep runs to completion; it must warn on stderr and not panic.
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found yet"),
+        "expected a keylog-not-found warning, got: {stderr}"
+    );
     let _ = std::fs::remove_file(&path);
 }
 
@@ -378,7 +385,7 @@ fn truncated_pcap_header() {
     // Write only 12 bytes of the 24-byte pcap header
     std::fs::write(
         &path,
-        &[0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0, 0, 0, 0],
+        [0xd4, 0xc3, 0xb2, 0xa1, 0x02, 0x00, 0x04, 0x00, 0, 0, 0, 0],
     )
     .unwrap();
     let output = netgrep()
@@ -636,7 +643,7 @@ fn http_chunked_with_huge_chunk_size_line() {
     let path = temp_pcap("http_huge_chunk");
     let mut payload = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
     // 150-char chunk size line
-    payload.extend_from_slice(&vec![b'a'; 150]);
+    payload.extend_from_slice(&[b'a'; 150]);
     payload.extend_from_slice(b"\r\n");
 
     let packets = build_tcp_stream([10, 0, 0, 2], [10, 0, 0, 1], 80, 1234, &payload);

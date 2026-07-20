@@ -313,8 +313,8 @@ mod tests {
         let nonce = keys.build_nonce();
         // First 4 bytes of IV untouched, last 8 bytes XOR'd with 0xFF
         let mut expected = [0xFF; 12];
-        for i in 4..12 {
-            expected[i] = 0x00;
+        for byte in expected.iter_mut().skip(4) {
+            *byte = 0x00;
         }
         assert_eq!(nonce, expected);
     }

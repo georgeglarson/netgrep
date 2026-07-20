@@ -17,9 +17,10 @@ pub(crate) struct HandshakeResult {
 
 /// Parse a TLS handshake record and extract cryptographic parameters.
 ///
-/// `current_version` is the version already set on the connection (if any),
-/// used to preserve ClientHello's supported_versions detection over ServerHello's
-/// legacy version field.
+/// `current_version` is the negotiated version already fixed on the connection
+/// by an earlier ServerHello (if any). It exists only so a retransmitted
+/// ServerHello can't clobber that decision; the ClientHello's offered versions
+/// deliberately do not set the negotiated version (only the ServerHello does).
 ///
 /// M8: Callers should use `TlsDecryptor::accumulate_handshake` to reassemble
 /// handshake messages spanning multiple TLS records before calling this function.
@@ -63,18 +64,12 @@ pub(crate) fn parse_handshake(
                 }
                 result.client_addr = Some((src_ip, src_port));
 
-                // Detect TLS 1.3 from supported_versions extension
-                if let Some(ext_data) = ch.ext
-                    && let Ok((_, exts)) = parse_tls_client_hello_extensions(ext_data)
-                {
-                    for ext in &exts {
-                        if let TlsExtension::SupportedVersions(versions) = ext
-                            && versions.contains(&TlsVersion::Tls13)
-                        {
-                            result.version = Some(TlsVersion::Tls13);
-                        }
-                    }
-                }
+                // The ClientHello only *offers* versions (its supported_versions
+                // extension lists everything the client will accept, and every
+                // modern client offers TLS 1.3). It does not decide the session
+                // version — the server does, in the ServerHello. Setting the
+                // negotiated version from the client's offer misclassifies any
+                // session the server downgrades to 1.2, breaking decryption.
             }
             TlsMessage::Handshake(TlsMessageHandshake::ServerHello(sh)) => {
                 if sh.random.len() == 32 {
@@ -84,9 +79,12 @@ pub(crate) fn parse_handshake(
                 }
                 result.cipher_suite = Some(sh.cipher);
 
-                // Only set version from ServerHello if not already determined
-                // (ClientHello's supported_versions takes priority)
-                if current_version.is_none() && result.version.is_none() {
+                // The ServerHello determines the negotiated version. Start from
+                // the legacy version field (0x0303 for both 1.2 and 1.3), then
+                // upgrade to 1.3 below if the supported_versions extension says
+                // so. The current_version guard only avoids clobbering a version
+                // already fixed by an earlier (retransmitted) ServerHello.
+                if current_version.is_none() {
                     result.version = Some(sh.version);
                 }
 
@@ -357,13 +355,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_synthetic_client_hello_detects_tls13() {
+    fn client_hello_offer_does_not_set_negotiated_version() {
+        // A ClientHello advertising TLS 1.3 in supported_versions is only an
+        // offer; the negotiated version is decided by the ServerHello. The
+        // offer alone must not set result.version.
         let random = [0xAA; 32];
         let ch_body = build_client_hello(&random, true);
         let src_ip: IpAddr = "10.0.0.1".parse().unwrap();
 
         let result = parse_handshake(&ch_body, src_ip, 12345, None).unwrap();
-        assert_eq!(result.version, Some(TlsVersion::Tls13));
+        assert_eq!(result.version, None);
     }
 
     #[test]
@@ -378,6 +379,33 @@ mod tests {
         assert!(result.should_derive);
         // Without supported_versions ext, should get TLS 1.2
         assert_eq!(result.version, Some(TlsVersion::Tls12));
+    }
+
+    #[test]
+    fn client_tls13_offer_does_not_override_server_negotiated_tls12() {
+        // Regression: every modern client (curl, browsers) advertises TLS 1.3
+        // in the ClientHello supported_versions extension even when the server
+        // negotiates down to TLS 1.2. The *negotiated* version is the server's
+        // choice (ServerHello), not the client's offer (ClientHello). Before the
+        // fix, netgrep locked onto the ClientHello's 1.3 offer and then failed to
+        // decrypt the real 1.2 session (looked up empty 1.3 secrets).
+        let c_ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let s_ip: IpAddr = "10.0.0.2".parse().unwrap();
+
+        // ClientHello advertising TLS 1.3 via supported_versions.
+        let ch = build_client_hello(&[0xAA; 32], true);
+        let after_ch = parse_handshake(&ch, c_ip, 12345, None).unwrap();
+
+        // ServerHello with no supported_versions ext => negotiated TLS 1.2.
+        // Thread the version forward exactly as process_handshake does.
+        let sh = build_server_hello(&[0xBB; 32], 0xC02F);
+        let after_sh = parse_handshake(&sh, s_ip, 443, after_ch.version).unwrap();
+
+        assert_eq!(
+            after_sh.version,
+            Some(TlsVersion::Tls12),
+            "server-negotiated TLS 1.2 must win over the client's TLS 1.3 offer"
+        );
     }
 
     #[test]
