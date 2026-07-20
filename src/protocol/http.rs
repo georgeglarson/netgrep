@@ -172,10 +172,8 @@ fn find_next_http_start(data: &[u8]) -> Option<usize> {
                     return Some(i);
                 }
             }
-            b'T' => {
-                if check_methods(remaining, METHOD_T) {
-                    return Some(i);
-                }
+            b'T' if check_methods(remaining, METHOD_T) => {
+                return Some(i);
             }
             _ => {}
         }

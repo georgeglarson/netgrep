@@ -292,7 +292,7 @@ impl CaptureEvent {
             String::new()
         };
 
-        let header = format!("HTTP {} {}{}", stream_id, &info, count_suffix);
+        let header = format!("HTTP {} {}{}", stream_id, info, count_suffix);
 
         // Combine all messages into the display, capping total size.
         const MAX_DISPLAY_BYTES: usize = 256 * 1024;
