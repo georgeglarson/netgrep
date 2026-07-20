@@ -74,16 +74,27 @@ fn decrypts_real_tls12_session() {
 #[test]
 fn marker_is_genuinely_encrypted() {
     // Negative control: without the keylog the marker must NOT appear, proving
-    // the positive tests above are decrypting rather than matching cleartext.
+    // the positive tests above decrypt rather than match cleartext.
+    //
+    // We assert netgrep actually *processed* the capture (its per-run summary
+    // line) instead of trusting an exit code. netgrep does not adopt grep's
+    // nonzero-on-no-match convention, and coupling to that would make this the
+    // one test that silently breaks if it ever did — worse, an empty stdout
+    // from a crash would masquerade as "marker absent" and pass.
     let out = netgrep()
         .arg("-I")
         .arg(fixture("tls12_ecdhe_rsa_aesgcm.pcap"))
         .arg("netgrep-tls12-marker-4Rk")
         .output()
         .expect("failed to run netgrep");
-    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !String::from_utf8_lossy(&out.stdout).contains("netgrep-tls12-marker-4Rk"),
-        "marker must be encrypted — it should not be visible without the keylog"
+        stderr.contains("packets seen"),
+        "netgrep should have processed the capture; summary line missing.\nstderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("netgrep-tls12-marker-4Rk"),
+        "marker must be encrypted; it should not be visible without the keylog"
     );
 }
