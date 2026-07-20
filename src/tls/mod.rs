@@ -53,14 +53,18 @@ struct TlsConnection {
     /// Once true, only application keys are tried (no dual-try fallback).
     client_hs_complete: bool,
     server_hs_complete: bool,
-    /// Set once any application-epoch record has been processed for this
-    /// connection (see drain_buffer for how the epoch is determined per TLS
-    /// version). Mid-stream key derivation (live keylog) is only safe before
-    /// this: a freshly-derived DirectionKeys starts its AEAD sequence counter
-    /// at 0, which is only correct if no earlier app-epoch record was skipped.
-    /// Deriving after app data has flowed would desync the counter and make
-    /// every subsequent record fail to decrypt — silently and permanently.
-    app_data_started: bool,
+    /// Set, per direction, once an application-epoch record has been processed
+    /// for that direction (see drain_buffer for how the epoch is determined per
+    /// TLS version). Mid-stream key derivation (live keylog) is only safe for a
+    /// direction before this: a freshly-derived DirectionKeys starts its AEAD
+    /// sequence counter at 0, correct only if no earlier app-epoch record was
+    /// skipped in that direction. It is per-direction because TLS 1.3 client and
+    /// server traffic secrets can arrive in the keylog at different times, so
+    /// one direction decrypting must not slam the derivation window shut on the
+    /// other. Deriving a direction after its app data has flowed would desync
+    /// its counter and make every later record in it fail — silently.
+    client_app_data_started: bool,
+    server_app_data_started: bool,
     /// One-shot guard so the "secret arrived too late to decrypt" warning is
     /// emitted at most once per connection.
     warned_missed_key_window: bool,
@@ -89,7 +93,8 @@ impl TlsConnection {
             handshake_buf_server: Vec::new(),
             client_hs_complete: false,
             server_hs_complete: false,
-            app_data_started: false,
+            client_app_data_started: false,
+            server_app_data_started: false,
             warned_missed_key_window: false,
         }
     }
@@ -365,11 +370,17 @@ impl TlsDecryptor {
                         plaintext.zeroize();
                     }
                     // Once an application-epoch record has flowed (decrypted or
-                    // not), a later key derivation from a late keylog secret
-                    // would desync the app-keys AEAD sequence counter, so
-                    // decrypt_record stops re-deriving past this point.
+                    // not) in THIS direction, a later key derivation for it from
+                    // a late keylog secret would desync its app-keys AEAD
+                    // sequence, so decrypt_record stops re-deriving that
+                    // direction past this point. Tracked per direction so the
+                    // other direction's window stays open.
                     if app_epoch && let Some(conn) = self.connections.get_mut(key) {
-                        conn.app_data_started = true;
+                        if from_client {
+                            conn.client_app_data_started = true;
+                        } else {
+                            conn.server_app_data_started = true;
+                        }
                     }
                 }
                 _ => {}
@@ -514,13 +525,15 @@ impl TlsDecryptor {
                 Some(c) => c,
                 None => return,
             };
-            // Nothing left to do only once BOTH directions' application keys are
-            // set. For TLS 1.3 the client/server traffic secrets can land in the
-            // keylog at different times, so bailing on client_keys alone would
-            // strand the server direction (and vice versa). TLS 1.2 derives both
-            // from one master secret, so both flip together — this is equivalent
-            // there.
-            if conn.client_keys.is_some() && conn.server_keys.is_some() {
+            // Nothing left to derive once each direction is either already keyed
+            // or locked out because its application epoch already started (a late
+            // secret can no longer be used there). For TLS 1.3 the client/server
+            // traffic secrets can land at different times, so bailing on
+            // client_keys alone would strand the server direction. TLS 1.2
+            // derives both from one master secret, so both flip together.
+            let client_done = conn.client_keys.is_some() || conn.client_app_data_started;
+            let server_done = conn.server_keys.is_some() || conn.server_app_data_started;
+            if client_done && server_done {
                 return;
             }
             let cr = match conn.client_random {
@@ -594,16 +607,20 @@ impl TlsDecryptor {
         };
 
         // Derive application traffic keys. Only fill a direction that has none
-        // yet: re-deriving would install a fresh DirectionKeys with its AEAD
-        // sequence reset to 0, desyncing an already-decrypting direction. This
-        // makes the function safe to re-enter as late secrets arrive.
+        // yet (re-deriving would reset its AEAD sequence to 0 and desync an
+        // already-decrypting direction) AND whose application epoch hasn't
+        // started (a fresh key at sequence 0 is only correct as that
+        // direction's first app-epoch record). Together these make the function
+        // safe to re-enter as late, possibly one-sided, secrets arrive.
         if conn.client_keys.is_none()
+            && !conn.client_app_data_started
             && let Some(ref client_secret) = secrets.client_traffic_secret_0
             && let Ok(keys) = decrypt::derive_tls13_keys(client_secret, hash_algo, aead_algo)
         {
             conn.client_keys = Some(keys);
         }
         if conn.server_keys.is_none()
+            && !conn.server_app_data_started
             && let Some(ref server_secret) = secrets.server_traffic_secret_0
             && let Ok(keys) = decrypt::derive_tls13_keys(server_secret, hash_algo, aead_algo)
         {
@@ -696,35 +713,37 @@ impl TlsDecryptor {
         src_ip: IpAddr,
         src_port: u16,
     ) -> Option<Vec<u8>> {
-        // Late-arriving keylog secrets (live capture): if we still have no keys
-        // for this connection, re-attempt derivation before decrypting. The
-        // ServerHello may have been processed before the client wrote this
-        // session's secret to the keylog; try_derive_keys refreshes the keylog
-        // on a miss, so a secret that landed since is picked up here.
+        // Late-arriving keylog secrets (live capture): if THIS record's
+        // direction still lacks application keys, re-attempt derivation before
+        // decrypting. The ServerHello may have been processed before the client
+        // wrote this session's secret to the keylog; try_derive_keys refreshes
+        // the keylog on a miss (and fills only the direction that's missing, at
+        // AEAD sequence 0), so a secret that landed since is picked up here.
         //
-        // But only while no application-data record has flowed yet. A freshly
-        // derived DirectionKeys starts its AEAD sequence counter at 0, which is
-        // correct only if we haven't already skipped an earlier ciphertext
-        // record for this connection. Deriving after app data has passed would
-        // leave the counter behind the peer's, so every record would fail to
-        // decrypt — silently and permanently. In that case decline (warn once).
-        // "Missing" means either direction still lacks application keys — TLS
-        // 1.3 client/server traffic secrets can land in the keylog separately,
-        // so we keep trying until both are in hand, not just until one is.
-        let (missing_keys, app_started) = self
-            .connections
-            .get(key)
-            .map(|c| {
-                (
-                    c.client_keys.is_none() || c.server_keys.is_none(),
-                    c.app_data_started,
-                )
-            })
-            .unwrap_or((false, false));
-        if missing_keys && !app_started {
+        // But only while this direction's application data hasn't flowed yet: a
+        // freshly derived DirectionKeys starts its sequence counter at 0, which
+        // is correct only if we haven't already skipped an app-epoch record in
+        // this direction. Deriving after that would leave the counter behind the
+        // peer's, so every record would fail — silently. Then decline (warn
+        // once). Tracked per direction because the two directions' traffic
+        // secrets can arrive in the keylog at different times.
+        let (is_from_client, dir_missing, dir_started) = {
+            let conn = self.connections.get(key)?;
+            let from_client = conn
+                .client_addr
+                .map(|(ip, port)| ip == src_ip && port == src_port)
+                .unwrap_or(false);
+            let (missing, started) = if from_client {
+                (conn.client_keys.is_none(), conn.client_app_data_started)
+            } else {
+                (conn.server_keys.is_none(), conn.server_app_data_started)
+            };
+            (from_client, missing, started)
+        };
+        if dir_missing && !dir_started {
             self.try_derive_keys(key);
-        } else if missing_keys
-            && app_started
+        } else if dir_missing
+            && dir_started
             && let Some(c) = self.connections.get_mut(key)
             && !c.warned_missed_key_window
         {
@@ -735,14 +754,8 @@ impl TlsDecryptor {
             );
         }
 
-        let conn = self.connections.get_mut(key)?;
-        let is_from_client = conn
-            .client_addr
-            .map(|(ip, port)| ip == src_ip && port == src_port)
-            .unwrap_or(false);
-
         // L23: Require explicit version
-        let version = conn.version?;
+        let version = self.connections.get(key)?.version?;
 
         if version == TlsVersion::Tls13 {
             self.decrypt_tls13_record(key, record, is_from_client)
