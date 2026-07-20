@@ -53,10 +53,11 @@ struct TlsConnection {
     /// Once true, only application keys are tried (no dual-try fallback).
     client_hs_complete: bool,
     server_hs_complete: bool,
-    /// Set once any application-data record has been processed for this
-    /// connection. Mid-stream key derivation (live keylog) is only safe before
+    /// Set once any application-epoch record has been processed for this
+    /// connection (see drain_buffer for how the epoch is determined per TLS
+    /// version). Mid-stream key derivation (live keylog) is only safe before
     /// this: a freshly-derived DirectionKeys starts its AEAD sequence counter
-    /// at 0, which is only correct if no earlier ciphertext record was skipped.
+    /// at 0, which is only correct if no earlier app-epoch record was skipped.
     /// Deriving after app data has flowed would desync the counter and make
     /// every subsequent record fail to decrypt — silently and permanently.
     app_data_started: bool,
@@ -326,6 +327,31 @@ impl TlsDecryptor {
                 // After CCS, handshake records (Finished) are encrypted — decrypt to advance seq
                 TlsRecordType::Handshake | TlsRecordType::ApplicationData => {
                     let is_app_data = record.hdr.record_type == TlsRecordType::ApplicationData;
+                    // Whether this record belongs to the application-data epoch,
+                    // which is what consumes the *application* keys' AEAD
+                    // sequence. TLS 1.2 exposes the type on the wire, so the
+                    // ApplicationData record type is authoritative. TLS 1.3
+                    // disguises every post-ServerHello record as ApplicationData
+                    // on the wire (EncryptedExtensions, Certificate, Finished,
+                    // real app data all share type 23), so the wire type would
+                    // wrongly flag the handshake records. Use the handshake-phase
+                    // flag as it stood *before* this record: only records after
+                    // the Finished are app-epoch (the Finished itself flips
+                    // hs_complete but is still handshake-epoch).
+                    let app_epoch = match self.connections.get(key).and_then(|c| c.version) {
+                        Some(TlsVersion::Tls13) => self
+                            .connections
+                            .get(key)
+                            .map(|c| {
+                                if from_client {
+                                    c.client_hs_complete
+                                } else {
+                                    c.server_hs_complete
+                                }
+                            })
+                            .unwrap_or(false),
+                        _ => is_app_data,
+                    };
                     if let Some(mut plaintext) = self.decrypt_record(key, &record, src_ip, src_port)
                     {
                         if is_app_data && let Some(conn) = self.connections.get_mut(key) {
@@ -338,11 +364,11 @@ impl TlsDecryptor {
                         }
                         plaintext.zeroize();
                     }
-                    // Record that application data has now flowed (decrypted or
-                    // not): past this point a late keylog secret can no longer
-                    // be used without desyncing the AEAD sequence counter, so
-                    // decrypt_record stops re-deriving for this connection.
-                    if is_app_data && let Some(conn) = self.connections.get_mut(key) {
+                    // Once an application-epoch record has flowed (decrypted or
+                    // not), a later key derivation from a late keylog secret
+                    // would desync the app-keys AEAD sequence counter, so
+                    // decrypt_record stops re-deriving past this point.
+                    if app_epoch && let Some(conn) = self.connections.get_mut(key) {
                         conn.app_data_started = true;
                     }
                 }
