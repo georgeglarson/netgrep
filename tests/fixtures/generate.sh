@@ -9,8 +9,9 @@
 # The keylogs hold secrets for ephemeral localhost sessions to a self-signed
 # cert; they protect nothing and are safe to commit as test data.
 #
-# Requires: openssl, curl (built against OpenSSL/GnuTLS so SSLKEYLOGFILE works),
-# tcpdump with sudo, and a free loopback port. Run from the repo root:
+# Requires: Linux (captures on the "lo" loopback device; macOS is "lo0"),
+# openssl, curl (built against OpenSSL/GnuTLS so SSLKEYLOGFILE works), tcpdump
+# with sudo, and a free loopback port. Run from the repo root:
 #   sudo -v && tests/fixtures/generate.sh
 set -euo pipefail
 cd "$(dirname "$0")"

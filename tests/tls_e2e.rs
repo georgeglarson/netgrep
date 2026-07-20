@@ -16,7 +16,13 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn netgrep() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_netgrep"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_netgrep"));
+    // netgrep falls back to the SSLKEYLOGFILE env var when --keylog is absent.
+    // Strip it so these tests depend only on the explicit flag — otherwise a
+    // developer with SSLKEYLOGFILE exported (plausible right after running the
+    // fixture generator) would decrypt in the negative control and false-fail.
+    cmd.env_remove("SSLKEYLOGFILE");
+    cmd
 }
 
 fn fixture(name: &str) -> PathBuf {
