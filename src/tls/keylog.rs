@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 /// Secrets extracted from an SSLKEYLOGFILE, keyed by client_random.
@@ -10,6 +10,12 @@ pub struct KeyLog {
     pub master_secrets: HashMap<[u8; 32], Vec<u8>>,
     /// TLS 1.3: CLIENT_RANDOM -> traffic secrets
     pub tls13_secrets: HashMap<[u8; 32], Tls13Secrets>,
+    /// Source file, retained so `refresh()` can re-read secrets appended after
+    /// the initial load — SSLKEYLOGFILE is written *during* the sessions we
+    /// capture, so a live session's secrets arrive after we first read it.
+    source: Option<PathBuf>,
+    /// Size of the source at last read, to skip re-parsing an unchanged file.
+    last_size: u64,
 }
 
 /// TLS 1.3 per-connection secrets (handshake + application traffic keys).
@@ -44,13 +50,35 @@ impl KeyLog {
 
     pub fn from_file(path: &Path) -> Result<Self> {
         // Read first, then check size to avoid TOCTOU race between metadata() and read().
-        let mut raw =
-            std::fs::read(path).context(format!("Failed to read keylog: {}", path.display()))?;
-        if raw.len() as u64 > Self::MAX_KEYLOG_SIZE {
+        let mut raw = match std::fs::read(path) {
+            Ok(r) => r,
+            // A live capture can start before the client has created the
+            // keylog. Tolerate that: start empty, keep the path, and let
+            // refresh() pick the secrets up once they appear — rather than
+            // aborting the whole capture over a not-yet-written file.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "Warning: keylog {} not found yet — will read it once it appears",
+                    path.display()
+                );
+                return Ok(KeyLog {
+                    master_secrets: HashMap::new(),
+                    tls13_secrets: HashMap::new(),
+                    source: Some(path.to_path_buf()),
+                    last_size: 0,
+                });
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e))
+                    .context(format!("Failed to read keylog: {}", path.display()));
+            }
+        };
+        let read_len = raw.len() as u64;
+        if read_len > Self::MAX_KEYLOG_SIZE {
             raw.zeroize();
             anyhow::bail!(
                 "Keylog file too large ({} bytes, max {}): {}",
-                raw.len(),
+                read_len,
                 Self::MAX_KEYLOG_SIZE,
                 path.display()
             );
@@ -65,9 +93,48 @@ impl KeyLog {
                 anyhow::bail!("Keylog file is not valid UTF-8: {}", path.display());
             }
         };
-        let result = Self::parse(contents);
+        let mut result = Self::parse(contents);
         raw.zeroize();
+        if let Ok(ref mut kl) = result {
+            kl.source = Some(path.to_path_buf());
+            kl.last_size = read_len;
+        }
         result
+    }
+
+    /// Re-read the source keylog if it has grown (or was rotated), pulling in
+    /// newly-appended secrets. Returns true if the file changed and was
+    /// re-parsed. Cheap no-op when there's no source or the size is unchanged.
+    ///
+    /// This is what makes *live* decryption work: SSLKEYLOGFILE is append-only
+    /// and written by the client during the very sessions we're capturing, so
+    /// a new session's secrets land after we first read the file. On a decrypt
+    /// miss we call this to catch up.
+    pub fn refresh(&mut self) -> bool {
+        let Some(path) = self.source.clone() else {
+            return false;
+        };
+        let size = match std::fs::metadata(&path) {
+            Ok(m) => m.len(),
+            // Not there (yet) or unreadable — keep what we have.
+            Err(_) => return false,
+        };
+        if size == self.last_size {
+            return false;
+        }
+        // The file grew (append) or shrank (rotation): re-parse the whole
+        // thing. It's a superset of what we hold, bounded by MAX_KEYLOG_SIZE.
+        match Self::from_file(&path) {
+            Ok(mut fresh) => {
+                // Swap the fresh maps in; `fresh` then owns the old maps and
+                // its Drop zeroizes them. Keep our own source unchanged.
+                std::mem::swap(&mut self.master_secrets, &mut fresh.master_secrets);
+                std::mem::swap(&mut self.tls13_secrets, &mut fresh.tls13_secrets);
+                self.last_size = fresh.last_size;
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     pub fn parse(contents: &str) -> Result<Self> {
@@ -202,6 +269,55 @@ mod tests {
         assert!(secrets.server_traffic_secret_0.is_some());
     }
 
+    // Live-capture support: tolerate a missing keylog at startup, and pick up
+    // secrets appended to it after the initial read (the live-monitoring case).
+
+    #[test]
+    fn from_file_tolerates_missing_file() {
+        // A live capture may start before the client has created the keylog.
+        // Missing must be tolerated (empty, source retained for refresh), not
+        // a hard error that kills the whole capture.
+        let path =
+            std::env::temp_dir().join(format!("netgrep_missing_{}.keys", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let kl = KeyLog::from_file(&path).expect("missing keylog should be tolerated");
+        assert!(kl.master_secrets.is_empty());
+        assert!(kl.tls13_secrets.is_empty());
+    }
+
+    #[test]
+    fn refresh_picks_up_appended_secrets() {
+        use std::io::Write;
+        let path =
+            std::env::temp_dir().join(format!("netgrep_refresh_{}.keys", std::process::id()));
+        let cr1 = "aa".repeat(32);
+        let cr2 = "cc".repeat(32);
+        let ms = "bb".repeat(48);
+        std::fs::write(&path, format!("CLIENT_RANDOM {cr1} {ms}\n")).unwrap();
+
+        let mut kl = KeyLog::from_file(&path).unwrap();
+        assert_eq!(kl.master_secrets.len(), 1);
+
+        // A new session's secret is appended after the initial read — exactly
+        // what SSLKEYLOGFILE does mid-capture. refresh() must pull it in.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "CLIENT_RANDOM {cr2} {ms}").unwrap();
+        drop(f);
+
+        assert!(kl.refresh(), "refresh should report the file grew");
+        assert_eq!(
+            kl.master_secrets.len(),
+            2,
+            "appended secret must be picked up"
+        );
+        assert!(!kl.refresh(), "unchanged file: refresh is a no-op");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // T13: KeyLog edge case tests
 
     #[test]
@@ -262,8 +378,14 @@ mod tests {
     }
 
     #[test]
-    fn keylog_from_nonexistent_file_returns_error() {
-        let result = KeyLog::from_file(std::path::Path::new("/nonexistent/path/keylog.txt"));
-        assert!(result.is_err());
+    fn keylog_from_unreadable_path_still_errors() {
+        // A *missing* file is now tolerated (see from_file_tolerates_missing_file,
+        // for the live-capture case), but a genuine read error must still
+        // surface — reading a directory as a keylog is not NotFound.
+        let result = KeyLog::from_file(&std::env::temp_dir());
+        assert!(
+            result.is_err(),
+            "reading a directory as a keylog should error"
+        );
     }
 }

@@ -253,8 +253,15 @@ fn cli_nonexistent_keylog_file() {
         ])
         .output()
         .unwrap();
-    // Should fail gracefully, not panic
-    assert!(!output.status.success());
+    // A missing keylog is now tolerated (start empty, warn, pick it up if it
+    // appears — the live-capture case), rather than aborting the capture. So
+    // netgrep runs to completion; it must warn on stderr and not panic.
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not found yet"),
+        "expected a keylog-not-found warning, got: {stderr}"
+    );
     let _ = std::fs::remove_file(&path);
 }
 

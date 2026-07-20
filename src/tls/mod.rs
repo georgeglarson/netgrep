@@ -514,6 +514,11 @@ impl TlsDecryptor {
         hash_algo: hkdf::Algorithm,
         aead_algo: &'static aead::Algorithm,
     ) {
+        // Live capture: the client may write this session's secret to the
+        // keylog after we first read it. On a miss, re-read before giving up.
+        if !self.keylog.tls13_secrets.contains_key(client_random) {
+            self.keylog.refresh();
+        }
         let mut secrets = match self.keylog.tls13_secrets.get(client_random) {
             Some(s) => s.clone(),
             None => return,
@@ -562,6 +567,11 @@ impl TlsDecryptor {
         aead_algo: &'static aead::Algorithm,
         hmac_algo: ring::hmac::Algorithm,
     ) {
+        // Live capture: the client may write this session's master secret to
+        // the keylog after we first read it. On a miss, re-read before failing.
+        if !self.keylog.master_secrets.contains_key(client_random) {
+            self.keylog.refresh();
+        }
         let mut master_secret = match self.keylog.master_secrets.get(client_random) {
             Some(ms) => ms.clone(),
             None => return,
@@ -613,6 +623,20 @@ impl TlsDecryptor {
         src_ip: IpAddr,
         src_port: u16,
     ) -> Option<Vec<u8>> {
+        // Late-arriving keylog secrets (live capture): if we still have no keys
+        // for this connection, re-attempt derivation before decrypting. The
+        // ServerHello may have been processed before the client wrote this
+        // session's secret to the keylog; try_derive_keys refreshes the keylog
+        // on a miss, so a secret that landed since is picked up here.
+        let no_keys = self
+            .connections
+            .get(key)
+            .map(|c| c.client_keys.is_none() && c.server_keys.is_none())
+            .unwrap_or(false);
+        if no_keys {
+            self.try_derive_keys(key);
+        }
+
         let conn = self.connections.get_mut(key)?;
         let is_from_client = conn
             .client_addr
